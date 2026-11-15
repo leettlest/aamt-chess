@@ -1,0 +1,17 @@
+{
+  "name": "royal-3d-chess",
+  "version": "1.0.0",
+  "description": "Royal 3D Chess — play Stockfish 19 in a fully 3D board (Three.js + chess.js)",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "chess.js": "^1.4.0",
+    "stockfish": "^19.0.1",
+    "three": "^0.187.0"
+  }
+}

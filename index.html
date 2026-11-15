@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Royal 3D Chess — Stockfish Engine</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♞</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Marcellus&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./node_modules/three/build/three.module.js",
+    "three/addons/": "./node_modules/three/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+  <!-- 3D board canvas -->
+  <div id="board-wrap">
+    <canvas id="board-canvas"></canvas>
+
+    <!-- Brand -->
+    <div id="brand">
+      <div id="brand-mark">♞</div>
+      <div>
+        <h1>Royal 3D Chess</h1>
+        <p>Powered by <span>Stockfish 19</span></p>
+      </div>
+    </div>
+
+    <!-- Eval bar -->
+    <div id="evalbar" title="Engine evaluation (White perspective)">
+      <div id="evalbar-fill"></div>
+      <div id="evalbar-label">–</div>
+    </div>
+
+    <!-- Turn toast -->
+    <div id="turntoast" class="hidden"></div>
+
+    <!-- Think spinner -->
+    <div id="thinking" class="hidden">
+      <div class="ring"></div><span>Stockfish is thinking…</span>
+    </div>
+
+    <!-- Promotion picker -->
+    <div id="promo" class="hidden">
+      <div id="promo-card">
+        <h3>Promote to</h3>
+        <div id="promo-choices">
+          <button data-piece="q">♛</button>
+          <button data-piece="r">♜</button>
+          <button data-piece="b">♝</button>
+          <button data-piece="n">♞</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Game over card -->
+    <div id="gameover" class="hidden">
+      <div id="gameover-card">
+        <div id="gameover-glyph">👑</div>
+        <h2 id="gameover-title">Checkmate</h2>
+        <p id="gameover-sub">White wins</p>
+        <button id="gameover-again">Play Again</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Control panel -->
+  <aside id="panel">
+    <!-- Matchup header: this vs this -->
+    <div class="card matchup" id="matchup">
+      <div class="mrow" id="mrow-w">
+        <div class="m-avatar m-avatar-w">♔</div>
+        <div class="m-info">
+          <div class="m-name" id="m-name-w">White</div>
+          <div class="m-sub" id="m-sub-w">White</div>
+        </div>
+        <div class="m-right">
+          <div class="m-acc"><b id="m-acc-w">–</b><small>ACC</small></div>
+          <div class="m-caps"><span class="m-pieces" id="m-caps-w"></span><span class="m-score" id="m-score-w"></span></div>
+        </div>
+      </div>
+      <div class="m-divider"><span>VS</span></div>
+      <div class="mrow" id="mrow-b">
+        <div class="m-avatar m-avatar-b">♚</div>
+        <div class="m-info">
+          <div class="m-name" id="m-name-b">Black</div>
+          <div class="m-sub" id="m-sub-b">Black</div>
+        </div>
+        <div class="m-right">
+          <div class="m-acc"><b id="m-acc-b">–</b><small>ACC</small></div>
+          <div class="m-caps"><span class="m-pieces" id="m-caps-b"></span><span class="m-score" id="m-score-b"></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="status-wrap">
+      <div id="status-dot"></div>
+      <div id="status-text">White to move</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Game Mode</div>
+      <div class="segmented" id="mode-seg">
+        <button class="seg active" data-mode="engine">♟ vs Engine</button>
+        <button class="seg" data-mode="local">♟♟ Two Players</button>
+      </div>
+
+      <div id="engine-opts">
+        <div class="card-title" style="margin-top:14px">Difficulty</div>
+        <div class="diff-grid" id="diff-grid"></div>
+
+        <div class="card-title" style="margin-top:14px">Play as</div>
+        <div class="segmented" id="color-seg">
+          <button class="seg active" data-color="w">White</button>
+          <button class="seg" data-color="random">Random</button>
+          <button class="seg" data-color="b">Black</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card actions">
+      <button id="btn-new" class="btn primary">⟳&nbsp; New Game</button>
+      <button id="btn-flip" class="btn">⤾&nbsp; Flip</button>
+      <button id="btn-undo" class="btn">↩&nbsp; Undo</button>
+      <button id="btn-hint" class="btn">💡&nbsp; Hint</button>
+      <button id="btn-sound" class="btn icon" title="Toggle sound">🔊</button>
+    </div>
+
+
+
+    <div class="card" id="analytics-card">
+      <div class="card-title-row">
+        <div class="card-title" style="margin:0">Analytics &amp; Predictions</div>
+        <button id="btn-analyze" class="mini-btn">Deep Analyze</button>
+      </div>
+      <div id="opening-line"><span>Opening</span> · awaiting first moves…</div>
+
+      <div class="graph-label"><span>Evaluation</span><b id="glabel-eval">+0.0</b></div>
+      <canvas id="eval-graph"></canvas>
+
+      <div class="graph-label"><span>Win Probability</span><b id="glabel-wp">50%</b></div>
+      <canvas id="wp-graph" class="graph-sm"></canvas>
+
+      <div class="graph-label"><span>Material Balance</span><b id="glabel-mat">+0</b></div>
+      <canvas id="material-graph" class="graph-sm"></canvas>
+
+      <div id="acc-bars">
+        <div class="acc-bar-row">
+          <span class="acc-bar-label white">White</span>
+          <div class="acc-track"><div class="acc-fill fill-w" id="accbar-w"></div></div>
+          <b class="acc-num" id="accnum-w">–</b>
+        </div>
+        <div class="acc-bar-row">
+          <span class="acc-bar-label black">Black</span>
+          <div class="acc-track"><div class="acc-fill fill-b" id="accbar-b"></div></div>
+          <b class="acc-num" id="accnum-b">–</b>
+        </div>
+      </div>
+
+      <div class="graph-label" style="margin-top:10px"><span>Move Quality</span><em class="qual-legend">! good · ?! inacc · ? mistake · ?? blunder</em></div>
+      <div class="qual-row">
+        <span class="qual-side">White</span>
+        <div class="qual-bar" id="qual-bar-w"><span class="qual-empty">—</span></div>
+        <span class="qual-count" id="qual-count-w">0 mv</span>
+      </div>
+      <div class="qual-row">
+        <span class="qual-side">Black</span>
+        <div class="qual-bar" id="qual-bar-b"><span class="qual-empty">—</span></div>
+        <span class="qual-count" id="qual-count-b">0 mv</span>
+      </div>
+
+      <div id="pred-line">Prediction · <b>dead equal</b> · White 50%</div>
+    </div>
+
+    <div class="card moves-card">
+      <div class="card-title">Moves</div>
+      <div id="moves-scroll">
+        <table id="moves-table"><tbody></tbody></table>
+        <div id="moves-empty">Opening theory… make the first move.</div>
+      </div>
+    </div>
+
+    <div id="record-line">Record vs Stockfish · <b>0W</b> · 0D · 0L</div>
+    <div id="keys-hint">N new · F flip · U undo · H hint · M sound</div>
+    <div id="engine-foot">Stockfish 19 Lite · depth <span id="foot-depth">–</span> · <span id="foot-state">loading engine…</span></div>
+  </aside>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
