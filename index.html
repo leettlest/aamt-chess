@@ -7,7 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>♞</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Marcellus&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Marcellus&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 <script type="importmap">
 {
@@ -57,6 +57,73 @@
           <button data-piece="b">♝</button>
           <button data-piece="n">♞</button>
         </div>
+      </div>
+    </div>
+
+    <!-- AI Coach modal -->
+    <div id="coach" class="hidden" role="dialog" aria-modal="true" aria-label="AI Coach">
+      <div id="coach-card">
+        <div id="coach-head">
+          <div id="coach-title">
+            <div id="coach-mark">♞</div>
+            <div>
+              <h3>AI Coach</h3>
+              <p id="coach-status">Not connected — add a key</p>
+            </div>
+          </div>
+          <div id="coach-head-actions">
+            <button id="coach-settings-toggle" class="mini-btn" title="Coach settings">🔑&nbsp; Key</button>
+            <button id="coach-close" class="icon-btn" aria-label="Close coach">✕</button>
+          </div>
+        </div>
+
+        <!-- Key / endpoint settings -->
+        <div id="coach-settings" class="hidden">
+          <label class="coach-field">
+            <span>Base URL <em>OpenAI-compatible</em></span>
+            <input id="coach-base" type="url" spellcheck="false" placeholder="https://openrouter.ai/api/v1" autocomplete="off" />
+          </label>
+          <label class="coach-field">
+            <span>Model</span>
+            <input id="coach-model" type="text" spellcheck="false" list="coach-models" placeholder="openai/gpt-4o-mini" autocomplete="off" />
+            <datalist id="coach-models">
+              <option value="openai/gpt-4o-mini"></option>
+              <option value="openai/gpt-4o"></option>
+              <option value="anthropic/claude-3.5-sonnet"></option>
+              <option value="anthropic/claude-3.5-haiku"></option>
+              <option value="google/gemma-2-27b-it"></option>
+              <option value="meta-llama/llama-3.3-70b-instruct"></option>
+            </datalist>
+          </label>
+          <label class="coach-field">
+            <span>API key</span>
+            <input id="coach-key" type="password" spellcheck="false" placeholder="sk-…" autocomplete="off" />
+          </label>
+          <div class="coach-settings-foot">
+            <p>Stored only in this browser · sent only to the endpoint above. Any OpenAI-compatible endpoint with browser CORS works — OpenRouter is the easy path. Key format auto-sets the endpoint (<code>gsk_</code> → Groq, <code>sk-or-</code> → OpenRouter, <code>sk-</code> → OpenAI).</p>
+            <div class="coach-settings-actions">
+              <button id="coach-forget" class="btn">Forget</button>
+              <button id="coach-test" class="btn">Test</button>
+              <button id="coach-save" class="btn primary" style="flex:0 0 auto; padding: 10px 22px;">Save key</button>
+            </div>
+            <div id="coach-test-result" class="coach-test-result"></div>
+          </div>
+        </div>
+
+        <!-- Conversation -->
+        <div id="coach-thread" aria-live="polite"></div>
+
+        <div id="coach-chips">
+          <button class="chip" data-q="Explain this position in plain words — what's the story and who's better?">📖 Explain the position</button>
+          <button class="chip" data-q="What is my best move here and why? Give me the SAN and a one-line reason.">🧠 Best move</button>
+          <button class="chip" data-q="Look at my last move with fresh eyes — was it good? What did it miss?">🔍 Review my last move</button>
+          <button class="chip" data-q="Teach me one concrete thing to work on right now — something I can fix this game.">🎯 Homework</button>
+        </div>
+
+        <form id="coach-form" autocomplete="off">
+          <textarea id="coach-input" rows="1" placeholder="Ask the coach… (Enter to send, Shift+Enter for new line)" aria-label="Ask the coach"></textarea>
+          <button type="submit" id="coach-send" aria-label="Send">➤</button>
+        </form>
       </div>
     </div>
 
@@ -130,6 +197,7 @@
       <button id="btn-flip" class="btn">⤾&nbsp; Flip</button>
       <button id="btn-undo" class="btn">↩&nbsp; Undo</button>
       <button id="btn-hint" class="btn">💡&nbsp; Hint</button>
+      <button id="btn-coach" class="btn">♞&nbsp; Coach</button>
       <button id="btn-sound" class="btn icon" title="Toggle sound">🔊</button>
     </div>
 
@@ -177,6 +245,25 @@
       </div>
 
       <div id="pred-line">Prediction · <b>dead equal</b> · White 50%</div>
+    </div>
+
+    <div class="card" id="profile-card">
+      <div class="card-title-row">
+        <div class="card-title" style="margin:0">Tracking SDK</div>
+        <button id="btn-reset-profile" class="mini-btn danger">Reset data</button>
+      </div>
+      <div class="profile-grid">
+        <div class="pstat"><small>Games</small><b id="p-games">0</b></div>
+        <div class="pstat"><small>W–D–L</small><b id="p-wdl">0-0-0</b></div>
+        <div class="pstat"><small>Win rate</small><b id="p-wrate">–</b></div>
+        <div class="pstat"><small>Avg acc</small><b id="p-acc">–</b></div>
+        <div class="pstat"><small>Avg cp loss</small><b id="p-loss">–</b></div>
+        <div class="pstat"><small>Blunders / game</small><b id="p-blunder">–</b></div>
+      </div>
+      <div id="profile-streak">Streak vs Stockfish · <b>—</b></div>
+      <div class="graph-label"><span>Accuracy — last 20</span><b id="glabel-trend">–</b></div>
+      <canvas id="acc-trend-graph" class="graph-sm"></canvas>
+      <div id="profile-foot">local to this browser · resets only when you clear it</div>
     </div>
 
     <div class="card moves-card">

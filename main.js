@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { Chess } from './node_modules/chess.js/dist/esm/chess.js';
+import { buildWatch } from './watch.js';
 
 /* ============================================================
    1 · CONFIG & STATE
@@ -57,6 +58,8 @@ const state = {
   deepDone: 0,
   evalHistory: [],           // white-perspective cp per ply (mate = ±100000)
   moveTags: {},              // history index -> '!!'|'!'|'?!'|'?'|'??'
+  moveTimes: [],             // {ply, color, ms} human-move timings
+  turnStartedAt: Date.now(), // when current side-to-move became to-move
 };
 
 const pieces = {};            // square -> Group
@@ -65,6 +68,8 @@ let camTween = null;
 
 const SETTINGS_KEY = 'royal3d-settings';
 const RECORD_KEY = 'royal3d-record';
+const PROFILE_KEY = 'royal3d-profile';
+const MAX_PROFILE_GAMES = 50;
 const loadLS = (k, fb) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
 let record = loadLS(RECORD_KEY, { w: 0, d: 0, l: 0 });
 
@@ -148,11 +153,11 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0f0c0a);
 scene.fog = new THREE.Fog(0x0f0c0a, 20, 46);
 
-const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
-camera.position.set(0, 8.1, 9.4);
+const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 100);
+camera.position.set(0, 8.8, 11.8);
 
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(0, 0, 0.25);
+controls.target.set(0, 0, 1.35);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.enablePan = false;
@@ -215,8 +220,8 @@ scene.add(warm);
 }
 
 /* board squares */
-const lightSqMat = new THREE.MeshStandardMaterial({ color: 0xe8d3a2, roughness: 0.55, metalness: 0.02 });
-const darkSqMat  = new THREE.MeshStandardMaterial({ color: 0x6b4226, roughness: 0.6,  metalness: 0.02 });
+const lightSqMat = new THREE.MeshStandardMaterial({ color: 0xc99a5b, roughness: 0.55, metalness: 0.02 });
+const darkSqMat  = new THREE.MeshStandardMaterial({ color: 0x3a2113, roughness: 0.58, metalness: 0.02 });
 const squareGeo = new THREE.BoxGeometry(SQ, 0.12, SQ);
 for (let r = 0; r < 8; r++) {
   for (let f = 0; f < 8; f++) {
@@ -230,7 +235,7 @@ for (let r = 0; r < 8; r++) {
 
 /* frame */
 {
-  const frameMat = new THREE.MeshStandardMaterial({ color: 0x3c2414, roughness: 0.42, metalness: 0.12 });
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x241209, roughness: 0.4, metalness: 0.1 });
   const FRAME_W = 0.62, FRAME_H = 0.26, half = 4 + FRAME_W / 2;
   const mk = (w, d, x, z) => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, FRAME_H, d), frameMat);
@@ -291,6 +296,9 @@ for (let r = 0; r < 8; r++) {
   addRail(-Math.PI / 2, -half, 0, '1 2 3 4 5 6 7 8');
 }
 
+/* the LESTRAMK Classic lies on the table beside the board */
+const { updateWatch } = buildWatch(scene);
+
 /* coordinate plane (invisible raycast target) */
 const boardPlane = new THREE.Mesh(
   new THREE.PlaneGeometry(8, 8),
@@ -322,8 +330,8 @@ const hlHover  = makeOverlay(0xffffff, 0.16);
 /* legal-move markers */
 const markersGroup = new THREE.Group();
 scene.add(markersGroup);
-const dotMat = new THREE.MeshBasicMaterial({ color: 0x10281a, transparent: true, opacity: 0.62, depthWrite: false });
-const ringMat = new THREE.MeshBasicMaterial({ color: 0x10281a, transparent: true, opacity: 0.75, depthWrite: false });
+const dotMat = new THREE.MeshBasicMaterial({ color: 0xe8c87a, transparent: true, opacity: 0.5, depthWrite: false });
+const ringMat = new THREE.MeshBasicMaterial({ color: 0xe8c87a, transparent: true, opacity: 0.6, depthWrite: false });
 const dotGeo = new THREE.CylinderGeometry(0.13, 0.13, 0.02, 24);
 const ringGeo = new THREE.TorusGeometry(0.34, 0.055, 10, 36);
 
@@ -777,6 +785,13 @@ function doMove(from, to, promotion) {
     setTimeout(() => { syncFromBoard(); refreshOverlays(); }, 240);
   }
 
+  {
+    const human = state.mode === 'local' || mv.color === state.playerColor;
+    const ms = Date.now() - (state.turnStartedAt || Date.now());
+    if (human) state.moveTimes.push({ ply: game.history().length - 1, color: mv.color, ms });
+    state.turnStartedAt = Date.now();
+  }
+
   // audio
   if (mv.captured) sfx.capture(); else sfx.move();
   const givesCheck = game.inCheck();
@@ -826,6 +841,7 @@ function checkGameEnd() {
     }
     try { localStorage.setItem(RECORD_KEY, JSON.stringify(record)); } catch { /* private mode */ }
     renderRecord();
+    recordProfileEntry();
   }
   refreshUI();
   return true;
@@ -1630,6 +1646,8 @@ function newGame() {
   thinkingEl.classList.add('hidden');
   clearMarkers();
   resetAnalytics();
+  state.moveTimes = [];
+  state.turnStartedAt = Date.now();
   syncFromBoard();
   engineSend('ucinewgame');
   evalFill.style.height = '50%';
@@ -1662,6 +1680,8 @@ function undo() {
   } else {
     game.undo();
   }
+  state.moveTimes = state.moveTimes.filter((t) => t.ply < game.history().length);
+  state.turnStartedAt = Date.now();
   const hist = game.history({ verbose: true });
   const last = hist[hist.length - 1];
   state.lastMove = last ? { from: last.from, to: last.to } : null;
@@ -1676,11 +1696,11 @@ function setFlipped(flipped) {
   state.flipped = flipped;
   clearHintArrow();
   saveSettings();
-  const z = flipped ? -9.4 : 9.4;
-  const tz = flipped ? -0.25 : 0.25;
+  const z = flipped ? -11.8 : 11.8;
+  const tz = flipped ? -1.35 : 1.35;
   camTween = {
     fromPos: camera.position.clone(),
-    toPos: new THREE.Vector3(0, 8.1, z),
+    toPos: new THREE.Vector3(0, 8.8, z),
     fromTarget: controls.target.clone(),
     toTarget: new THREE.Vector3(0, 0, tz),
     t: 0,
@@ -1801,6 +1821,7 @@ function tick() {
   }
 
   controls.update();
+  updateWatch();
 
   // hint arrow pulse
   if (state.hintArrow) {
@@ -1852,11 +1873,475 @@ applySettings();
 syncSettingsUI();
 renderRecord();
 if (state.flipped) {
-  camera.position.set(0, 8.1, -9.4);
-  controls.target.set(0, 0, -0.25);
+  camera.position.set(0, 8.8, -11.8);
+  controls.target.set(0, 0, -1.35);
 }
 resize();
 syncFromBoard();
 refreshUI();
+refreshProfile();
 liveAnalyze();
+
+/* ============================================================
+   15 · AI COACH (BYO OpenAI-compatible key)
+   ============================================================ */
+const AI_BASE_KEY = 'royal-ai-base';
+const AI_MODEL_KEY = 'royal-ai-model';
+const AI_KEY_KEY = 'royal-ai-key';
+
+const coach = {
+  base: loadLS(AI_BASE_KEY, 'https://openrouter.ai/api/v1'),
+  model: loadLS(AI_MODEL_KEY, 'openai/gpt-4o-mini'),
+  key: loadLS(AI_KEY_KEY, ''),
+  history: [],           // {role, content}
+  busy: false,
+};
+
+const coachModal = $('#coach');
+const coachThread = $('#coach-thread');
+const coachInput = $('#coach-input');
+const coachSend = $('#coach-send');
+const coachStatus = $('#coach-status');
+
+function saveLS(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+
+const KNOWN_BASES = ['https://openrouter.ai/api/v1', 'https://api.groq.com/openai/v1', 'https://api.openai.com/v1'];
+
+function detectProviderFromKey(key) {
+  if (key.startsWith('gsk_')) return { base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile', name: 'Groq' };
+  if (key.startsWith('sk-or-')) return { base: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini', name: 'OpenRouter' };
+  if (key.startsWith('sk-ant-')) return { base: 'https://openrouter.ai/api/v1', model: 'anthropic/claude-3.5-sonnet', name: 'Anthropic (via OpenRouter)' };
+  if (key.startsWith('sk-proj-') || key.startsWith('sk-')) return { base: 'https://api.openai.com/v1', model: 'gpt-4o-mini', name: 'OpenAI' };
+  return null;
+}
+
+function coachSaveSettings() {
+  const baseInput = $('#coach-base').value.trim().replace(/\/+$/, '');
+  const keyInput = $('#coach-key').value.trim();
+  const p = detectProviderFromKey(keyInput);
+  let detected = null;
+  // if the base URL is one of the app's defaults (or garbage), snap it to the key's provider
+  if (p && (!baseInput || KNOWN_BASES.includes(baseInput))) {
+    coach.base = p.base;
+    coach.model = p.model;
+    $('#coach-base').value = p.base;
+    $('#coach-model').value = p.model;
+    detected = p;
+  } else {
+    coach.base = baseInput || 'https://openrouter.ai/api/v1';
+    coach.model = $('#coach-model').value.trim() || 'openai/gpt-4o-mini';
+  }
+  coach.key = keyInput;
+  saveLS(AI_BASE_KEY, coach.base);
+  saveLS(AI_MODEL_KEY, coach.model);
+  saveLS(AI_KEY_KEY, coach.key);
+  syncCoachStatus();
+  $('#coach-settings').classList.add('hidden');
+  if (detected) showToast(`Detected ${detected.name} key — endpoint set automatically`);
+}
+function coachForgetSettings() {
+  coach.key = '';
+  try { localStorage.removeItem(AI_KEY_KEY); } catch {}
+  $('#coach-key').value = '';
+  syncCoachStatus();
+}
+
+function syncCoachStatus() {
+  const ok = coach.key.length > 8;
+  coachStatus.textContent = ok ? `Connected · ${coach.model}` : 'Not connected — add a key';
+  coachStatus.classList.toggle('ok', ok);
+  coachStatus.classList.toggle('err', !ok);
+  document.getElementById('btn-coach').classList.toggle('btn-coach-alert', !ok);
+}
+
+function coachContext() {
+  const sans = game.history();
+  const fen = game.fen();
+  const turn = game.turn() === 'w' ? 'White' : 'Black';
+  const inCheck = game.inCheck();
+  const over = game.isGameOver();
+  const op = openingName(sans);
+  const evalCp = [...state.evalHistory].reverse().find((v) => v != null);
+  const evalTxt = evalCp == null ? 'no eval yet' : (Math.abs(evalCp) >= 100000 ? (evalCp > 0 ? 'White mates' : 'Black mates') : `${evalCp >= 0 ? '+' : ''}${(evalCp / 100).toFixed(1)} (White POV)`);
+  const mat = computeMaterialHistory();
+  const matBal = mat.length ? mat[mat.length - 1] : 0;
+  const youAre = state.mode === 'engine' ? (state.playerColor === 'w' ? 'White (you vs engine)' : 'Black (you vs engine)') : 'Both sides (local 2-player)';
+  const engDiff = state.mode === 'engine' ? `engine difficulty: ${currentDiff().label}` : 'local two-player';
+  const moves = sans.length ? sans.join(' ') : '(game has not started)';
+  const lastEvalTxt = state.lastMove ? `Last move: ${sans[sans.length - 1]}` : 'No moves yet';
+  return [
+    `FEN: ${fen}`,
+    `Side to move: ${turn}${inCheck ? ' (in check!)' : ''}`,
+    `Game over: ${over}`,
+    `Opening: ${op ?? 'unknown'}`,
+    `Moves: ${moves}`,
+    lastEvalTxt,
+    `Engine eval: ${evalTxt}`,
+    `Material balance: ${matBal >= 0 ? '+' : ''}${matBal} pawns (White POV)`,
+    `You are: ${youAre} · ${engDiff}`,
+  ].join('\n');
+}
+
+const COACH_SYSTEM = `You are Royal Coach — the personal chess coach inside Royal 3D Chess. You can SEE this game: every position arrives as FEN plus SAN move list, whose turn it is, Stockfish's evaluation, material balance and the opening. Your job:
+- Give warm, direct, expert advice based ONLY on the actual position. Never invent a position.
+- Be concise: 2-6 sentences for most questions. Use short lists only when comparing options.
+- Suggest concrete moves in SAN notation, always grounded in the FEN and moves given.
+- When the player made a mistake you can see (big eval swing or an obvious blunder), say so plainly and explain the better idea.
+- Speak like a strong human coach, not a chess engine — explain the "why" briefly.
+- If asked about something off-topic, politely steer back to chess.
+The player plays chess at casual level — never assume master knowledge.`;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function mdLite(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  const lines = html.split('\n');
+  const out = [];
+  let inList = false;
+  for (const line of lines) {
+    const m = line.match(/^\s*[-*]\s+(.*)$/);
+    if (m) {
+      if (!inList) { out.push('<ul>'); inList = true; }
+      out.push(`<li>${m[1]}</li>`);
+    } else {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push(line ? `<p>${line}</p>` : '');
+    }
+  }
+  if (inList) out.push('</ul>');
+  return out.join('');
+}
+function appendCoachMessage(role, content) {
+  const el = document.createElement('div');
+  el.className = `coach-msg ${role}`;
+  if (role === 'coach') {
+    el.innerHTML = `<span class="coach-meta">Royal Coach</span>${mdLite(content)}`;
+  } else {
+    el.textContent = content;
+  }
+  coachThread.appendChild(el);
+  coachThread.scrollTop = coachThread.scrollHeight;
+  return el;
+}
+function showCoachThinking() {
+  const el = document.createElement('div');
+  el.className = 'coach-msg coach';
+  el.id = 'coach-typing';
+  el.innerHTML = `<span class="coach-meta">Royal Coach</span><span class="coach-typing">coach is thinking<span class="coach-dots"><i></i><i></i><i></i></span></span>`;
+  coachThread.appendChild(el);
+  coachThread.scrollTop = coachThread.scrollHeight;
+  return el;
+}
+function clearCoachThread() {
+  coachThread.innerHTML = '';
+  appendCoachMessage('coach', "♞ Welcome to the royal table. I can see your game — the position, every move, the evaluation. The key fields below are already open: paste your OpenAI-compatible key, press Save key, then ask anything — why your last move was wrong, what to play next, or just talk.");
+}
+
+async function coachSendMessage(text) {
+  if (coach.busy) return;
+  if (!coach.key) { $('#coach-settings').classList.remove('hidden'); showToast('Add an OpenAI-compatible API key first (🔑 Key)'); return; }
+  const q = text.trim();
+  if (!q) return;
+  appendCoachMessage('user', q);
+  coachInput.value = '';
+  coachInput.style.height = 'auto';
+  coach.history.push({ role: 'user', content: q });
+  const typing = showCoachThinking();
+  coach.busy = true;
+  coachSend.disabled = true;
+  try {
+    const res = await fetch(coach.base + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${coach.key}` },
+      body: JSON.stringify({
+        model: coach.model,
+        max_tokens: 420,
+        temperature: 0.5,
+        messages: [
+          { role: 'system', content: COACH_SYSTEM },
+          { role: 'system', content: `CURRENT GAME STATE:\n${coachContext()}` },
+          ...coach.history.slice(-12),
+        ],
+      }),
+    });
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
+    if (!res.ok) {
+      const msg = (data && data.error && data.error.message) || raw.slice(0, 220) || `HTTP ${res.status}`;
+      throw new Error(`API ${res.status}: ${msg}`);
+    }
+    const reply = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content && data.choices[0].message.content.trim();
+    if (!reply) throw new Error('Empty response from the model');
+    typing.remove();
+    coach.history.push({ role: 'assistant', content: reply });
+    appendCoachMessage('coach', reply);
+  } catch (err) {
+    typing.remove();
+    const msg = String((err && err.message) || err);
+    appendCoachMessage('coach', `I couldn't reach the coach — ${msg}. If you're not on the same network as the engine, CORS blocks some providers; OpenRouter or a local proxy works. Check the 🔑 Key tab — press Test to see the raw provider error, and make sure Base URL matches your key's service (Groq needs https://api.groq.com/openai/v1).`);
+    coach.history.pop(); // don't keep the failed user msg in history
+  } finally {
+    coach.busy = false;
+    coachSend.disabled = false;
+  }
+}
+
+function toggleCoach(open) {
+  const show = open ?? coachModal.classList.contains('hidden');
+  coachModal.classList.toggle('hidden', !show);
+  if (show) {
+    if (!coachThread.children.length) clearCoachThread();
+    coachInput.focus();
+  }
+}
+
+$('#btn-coach').addEventListener('click', () => toggleCoach(true));
+$('#coach-close').addEventListener('click', () => toggleCoach(false));
+$('#coach').addEventListener('click', (e) => { if (e.target.id === 'coach') toggleCoach(false); });
+$('#coach-settings-toggle').addEventListener('click', () => $('#coach-settings').classList.toggle('hidden'));
+$('#coach-save').addEventListener('click', coachSaveSettings);
+$('#coach-forget').addEventListener('click', coachForgetSettings);
+
+async function coachTestConnection() {
+  const result = $('#coach-test-result');
+  const baseInput = $('#coach-base').value.trim().replace(/\/+$/, '') || 'https://openrouter.ai/api/v1';
+  const modelInput = $('#coach-model').value.trim() || 'openai/gpt-4o-mini';
+  const keyInput = $('#coach-key').value.trim();
+  if (!keyInput) { result.textContent = 'Paste your key first.'; result.className = 'coach-test-result err'; return; }
+  result.textContent = 'Testing…';
+  result.className = 'coach-test-result pending';
+  const base = baseInput;
+  const model = modelInput;
+  const t0 = performance.now();
+  try {
+    const res = await fetch(base + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyInput}` },
+      body: JSON.stringify({ model, max_tokens: 4, temperature: 0, messages: [{ role: 'user', content: 'Reply with exactly: ok' }] }),
+    });
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
+    const ms = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      const msg = (data && data.error && data.error.message) || raw.slice(0, 160) || `HTTP ${res.status}`;
+      result.textContent = `✗ ${res.status} — ${msg}`;
+      result.className = 'coach-test-result err';
+      return;
+    }
+    result.textContent = `✓ Connected in ${ms} ms — ${model}`;
+    result.className = 'coach-test-result ok';
+  } catch (err) {
+    result.textContent = `✗ ${String((err && err.message) || err)}`;
+    result.className = 'coach-test-result err';
+  }
+}
+$('#coach-test').addEventListener('click', coachTestConnection);
+$('#coach-chips').addEventListener('click', (e) => {
+  const chip = e.target.closest('.chip');
+  if (chip) coachSendMessage(chip.dataset.q);
+});
+$('#coach-form').addEventListener('submit', (e) => { e.preventDefault(); coachSendMessage(coachInput.value); });
+coachInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); coachSendMessage(coachInput.value); }
+});
+coachInput.addEventListener('input', () => {
+  coachInput.style.height = 'auto';
+  coachInput.style.height = Math.min(coachInput.scrollHeight, 110) + 'px';
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !coachModal.classList.contains('hidden')) toggleCoach(false);
+});
+$('#coach-base').value = coach.base;
+$('#coach-model').value = coach.model;
+$('#coach-key').value = coach.key;
+syncCoachStatus();
+if (!coach.key) $('#coach-settings').classList.remove('hidden');
+
 tick();
+
+
+/* ============================================================
+   16 · LOCAL TRACKING SDK
+   ============================================================ */
+
+function loadProfile() {
+  const d = loadLS(PROFILE_KEY, []);
+  return Array.isArray(d) ? d.slice(-MAX_PROFILE_GAMES) : [];
+}
+function saveProfile(p) {
+  try { localStorage.setItem(PROFILE_KEY, JSON.stringify(p.slice(-MAX_PROFILE_GAMES))); } catch {}
+}
+
+function blunderCounts(verbose) {
+  const out = { w: 0, b: 0 };
+  for (let i = 0; i < verbose.length; i++) {
+    if (state.moveTags[i] === '??') out[verbose[i].color]++;
+  }
+  return out;
+}
+
+function avgCpLoss(verbose, evals) {
+  const sums = { w: 0, b: 0 }, counts = { w: 0, b: 0 };
+  for (let i = 1; i <= verbose.length; i++) {
+    const before = evals[i - 1], after = evals[i];
+    if (before == null || after == null) continue;
+    const mover = verbose[i - 1].color;
+    const sign = mover === 'w' ? 1 : -1;
+    const loss = Math.max(0, sign * (before - after));
+    if (loss > 10000) continue; // skip mate swings distorting average
+    sums[mover] += loss;
+    counts[mover]++;
+  }
+  return { w: counts.w ? Math.round(sums.w / counts.w) : null, b: counts.b ? Math.round(sums.b / counts.b) : null };
+}
+
+function recordProfileEntry() {
+  // only track games played against the engine; two-player on one machine knows nothing useful about "the user"
+  if (state.mode !== 'engine') return;
+  const verbose = game.history({ verbose: true });
+  if (!verbose.length) return;
+  const acc = state.lastAcc || computeAccuracies();
+  const losses = avgCpLoss(verbose, state.evalHistory);
+  const blunders = blunderCounts(verbose);
+  const thinkW = state.moveTimes.filter((t) => t.color === 'w');
+  const thinkB = state.moveTimes.filter((t) => t.color === 'b');
+  const thinkMsW = thinkW.length ? Math.round(thinkW.reduce((s, t) => s + t.ms, 0) / thinkW.length) : 0;
+  const thinkMsB = thinkB.length ? Math.round(thinkB.reduce((s, t) => s + t.ms, 0) / thinkB.length) : 0;
+  const result = state.winnerColor ? state.winnerColor : 'draw';
+  const entry = {
+    ts: Date.now(),
+    mode: 'engine',
+    diff: state.difficulty,
+    pCol: state.playerColor,
+    result,
+    moves: verbose.length,
+    accW: acc.wAcc != null ? Math.round(acc.wAcc) : null,
+    accB: acc.bAcc != null ? Math.round(acc.bAcc) : null,
+    lossW: losses.w,
+    lossB: losses.b,
+    blundersW: blunders.w,
+    blundersB: blunders.b,
+    thinkMsW,
+    thinkMsB,
+  };
+  const profile = loadProfile();
+  profile.push(entry);
+  saveProfile(profile);
+  refreshProfile();
+}
+
+function setPstat(id, val, cls) {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = val; el.className = cls || ''; }
+}
+function refreshProfile() {
+  const profile = loadProfile();
+  const g = profile.filter((p) => p.mode === 'engine');
+  if (!g.length) {
+    setPstat('p-games', '0'); setPstat('p-wdl', '0-0-0'); setPstat('p-wrate', '–');
+    setPstat('p-acc', '–'); setPstat('p-loss', '–'); setPstat('p-blunder', '–');
+    const strk = document.getElementById('profile-streak');
+    if (strk) strk.innerHTML = 'Streak vs Stockfish · <b>—</b> <span style="opacity:.55">· avg —</span>';
+    setPstat('glabel-trend', '–');
+    drawAccuracyTrend([]);
+    return;
+  }
+  const wins = g.filter((x) => x.result === x.pCol).length;
+  const draws = g.filter((x) => x.result === 'draw').length;
+  const losses = g.length - wins - draws;
+  const winRate = Math.round((wins / g.length) * 100);
+  const avg = (arr) => (arr.length ? Math.round(arr.reduce((s, v) => s + v, 0) / arr.length) : null);
+  const accs = g.map((x) => (x.pCol === 'w' ? x.accW : x.accB)).filter((v) => v != null);
+  const cps  = g.map((x) => (x.pCol === 'w' ? x.lossW : x.lossB)).filter((v) => v != null);
+  const bls  = g.map((x) => (x.pCol === 'w' ? x.blundersW : x.blundersB)).filter((v) => v != null);
+  const thr  = g.map((x) => (x.pCol === 'w' ? x.thinkMsW : x.thinkMsB)).filter((v) => v > 0);
+  const avgAcc = avg(accs), avgLoss = avg(cps), avgBl = avg(bls);
+  const avgThink = thr.length ? Math.round(thr.reduce((s, v) => s + v, 0) / thr.length) : null;
+
+  setPstat('p-games', String(g.length));
+  setPstat('p-wdl', `${wins}-${draws}-${losses}`);
+  setPstat('p-wrate', winRate + '%', winRate >= 55 ? 'good' : winRate <= 40 ? 'hot' : '');
+  setPstat('p-acc', avgAcc != null ? avgAcc + '%' : '–', avgAcc != null && avgAcc >= 75 ? 'good' : avgAcc != null && avgAcc < 55 ? 'hot' : '');
+  setPstat('p-loss', avgLoss != null ? '+' + avgLoss : '–');
+  setPstat('p-blunder', avgBl != null ? avgBl.toFixed(1) : '–', avgBl != null && avgBl > 1.5 ? 'hot' : '');
+
+  // streak vs Stockfish
+  const last = g[g.length - 1];
+  const outcomeOf = (x) => (x.result === 'draw' ? 'draw' : (x.result === x.pCol ? 'W' : 'L'));
+  let streak = 0;
+  const o = outcomeOf(last);
+  if (o !== 'draw') {
+    for (let i = g.length - 1; i >= 0; i--) {
+      if (outcomeOf(g[i]) === o) streak++; else break;
+    }
+  }
+  const streakTxt = o === 'draw' ? '—' : `${o}${streak}`;
+  const thrTxt = avgThink != null ? `${(avgThink / 1000).toFixed(1)}s/move` : '—';
+  const strk = document.getElementById('profile-streak');
+  if (strk) strk.innerHTML = `Streak vs Stockfish · <b>${streakTxt}</b> <span style="opacity:.55">· avg ${thrTxt}</span>`;
+
+  const last20 = g.slice(-20);
+  const trend = last20.map((x) => (x.pCol === 'w' ? x.accW : x.accB));
+  const trendAvg = avg(trend.filter((v) => v != null));
+  setPstat('glabel-trend', trendAvg != null ? trendAvg + '%' : '–');
+  drawAccuracyTrend(trend);
+}
+
+function drawAccuracyTrend(values) {
+  const canvas = document.getElementById('acc-trend-graph');
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== Math.round(w * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const pts = values.map((v, i) => ({ i, v })).filter((p) => p.v != null);
+  if (pts.length < 2) {
+    ctx.fillStyle = 'rgba(255,255,255,.16)';
+    ctx.font = '10px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('play vs engine to build a trend', w / 2, h / 2 + 3);
+    return;
+  }
+  const xFor = (i) => 10 + (i / (values.length - 1)) * (w - 20);
+  const yFor = (v) => h - 7 - (Math.min(100, Math.max(0, v)) / 100) * (h - 14);
+  for (const g of [25, 50, 75]) {
+    ctx.strokeStyle = 'rgba(255,255,255,.07)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, yFor(g)); ctx.lineTo(w, yFor(g)); ctx.stroke();
+  }
+  ctx.beginPath();
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (i === 0) ctx.moveTo(xFor(p.i), yFor(p.v)); else ctx.lineTo(xFor(p.i), yFor(p.v));
+  }
+  ctx.strokeStyle = '#e6c369';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = 'rgba(230,195,105,.55)';
+  ctx.shadowBlur = 6;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.lineTo(xFor(pts[pts.length - 1].i), h - 6);
+  ctx.lineTo(xFor(pts[0].i), h - 6);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(230,195,105,.13)';
+  ctx.fill();
+  const last = pts[pts.length - 1];
+  ctx.beginPath(); ctx.arc(xFor(last.i), yFor(last.v), 3.5, 0, Math.PI * 2); ctx.fillStyle = '#f6d98a'; ctx.fill();
+}
+
+document.getElementById('btn-reset-profile')?.addEventListener('click', () => {
+  if (!confirm('Erase locally-tracked games and stats?')) return;
+  try { localStorage.removeItem(PROFILE_KEY); } catch {}
+  refreshProfile();
+  showToast('Local tracking data cleared');
+});
