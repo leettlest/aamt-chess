@@ -3,7 +3,9 @@
    ============================================================ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { Water } from 'three/addons/objects/Water.js';
 import { Chess } from './node_modules/chess.js/dist/esm/chess.js';
 import { buildWatch } from './watch.js';
 
@@ -27,8 +29,9 @@ const DIFFS = [
 const game = new Chess();
 
 const state = {
-  mode: 'engine',            // 'engine' | 'local'
+  mode: 'engine',            // 'engine' | 'local' | 'lan'
   difficulty: 'club',
+  gameDifficulty: null,      // difficulty frozen at game start (for stats)
   playerColor: 'w',          // resolved color when playing vs engine
   preferredColor: 'w',       // 'w' | 'b' | 'random'
   flipped: false,
@@ -37,7 +40,13 @@ const state = {
   legalTargets: [],
   hoverSq: null,
   dragging: null,            // { piece, fromSq }
+  pendingDragHit: null,      // piece detected in capture phase before OrbitControls sees pointerdown
   engineThinking: false,
+  engineSearchFen: null,     // FEN of the position the current engine search was started from
+  engineGen: 0,              // bumped whenever a search is invalidated (new game / undo / new request)
+  engineToken: null,         // token of the active engine search
+  hintToken: null,           // token of the active hint search
+  blackTimer: null,          // delayed first move when playing Black
   engineReady: false,
   sound: true,
   lastMove: null,            // {from,to}
@@ -60,6 +69,18 @@ const state = {
   moveTags: {},              // history index -> '!!'|'!'|'?!'|'?'|'??'
   moveTimes: [],             // {ply, color, ms} human-move timings
   turnStartedAt: Date.now(), // when current side-to-move became to-move
+  recordPending: false,      // remaining positions queued to refine the written entry
+  recordGen: null,           // analysis generation the pending record belongs to
+  recordWritten: false,      // true once this game's entry + record counter were written
+  recordTs: null,            // timestamp of the entry being refined
+  lanColor: null,            // 'w' | 'b' when playing a LAN room
+  lanCode: null,             // joined room code
+  lanSocket: null,           // active WebSocket (/lan)
+  lanConnected: false,
+  lanPeer: false,            // opponent present and game started
+  applyingRemote: false,     // true while applying an echoed/remote move
+  lanMovePending: false,     // local move sent, waiting for the server echo
+  view2d: false,             // top-down orthographic view
 };
 
 const pieces = {};            // square -> Group
@@ -71,7 +92,11 @@ const RECORD_KEY = 'royal3d-record';
 const PROFILE_KEY = 'royal3d-profile';
 const MAX_PROFILE_GAMES = 50;
 const loadLS = (k, fb) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
-let record = loadLS(RECORD_KEY, { w: 0, d: 0, l: 0 });
+let record = (() => {
+  const r = loadLS(RECORD_KEY, {});
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  return { w: n(r?.w), d: n(r?.d), l: n(r?.l) };
+})();
 
 /* ============================================================
    2 · DOM REFS
@@ -105,6 +130,7 @@ const qualBarW = $('#qual-bar-w'), qualBarB = $('#qual-bar-b');
 const qualCountW = $('#qual-count-w'), qualCountB = $('#qual-count-b');
 const mrowW = $('#mrow-w'), mrowB = $('#mrow-b');
 const mNameW = $('#m-name-w'), mNameB = $('#m-name-b');
+const avW = $('#avatar-w'), avB = $('#avatar-b');
 const mSubW = $('#m-sub-w'), mSubB = $('#m-sub-b');
 const mAccW = $('#m-acc-w'), mAccB = $('#m-acc-b');
 const mCapsW = $('#m-caps-w'), mCapsB = $('#m-caps-b');
@@ -148,13 +174,26 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.12;
+renderer.transmissionResolutionScale = 0.5; // glass refraction pass at half resolution
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0f0c0a);
-scene.fog = new THREE.Fog(0x0f0c0a, 20, 46);
+scene.background = new THREE.Color(0x9cc4e0);
+scene.fog = new THREE.Fog(0xbcd6e8, 30, 90);
 
 const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 100);
 camera.position.set(0, 8.8, 11.8);
+
+/* true top-down view of the same scene — no second renderer */
+const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
+orthoCam.position.set(0, 22, 0.001);
+function updateOrthoUp() {
+  // default: White at the bottom of the screen; flip reverses it
+  orthoCam.up.set(0, 0, state.flipped ? 1 : -1);
+  orthoCam.lookAt(0, 0, 0);
+  orthoCam.updateProjectionMatrix();
+}
+updateOrthoUp();
+function activeCam() { return state.view2d ? orthoCam : camera; }
 
 const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 0, 1.35);
@@ -167,15 +206,21 @@ controls.minPolarAngle = 0.15;
 controls.maxPolarAngle = Math.PI * 0.44;
 controls.rotateSpeed = 0.7;
 
-try {
+/* daytime sky: real photographic HDRI with clouds (CC0, Poly Haven) */
+new RGBELoader().load('assets/day_sky.hdr', (hdr) => {
+  hdr.mapping = THREE.EquirectangularReflectionMapping;
+  scene.background = hdr;
+  scene.backgroundIntensity = 0.9;
+  scene.backgroundBlurriness = 0;
   const pmrem = new THREE.PMREMGenerator(renderer);
-  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.05).texture;
-  scene.environmentIntensity = 0.55;   // keep the room reflections classy, not washing out
-} catch (_) { /* fall back to lights only */ }
+  scene.environment = pmrem.fromEquirectangular(hdr).texture;
+  scene.environmentIntensity = 1.0;
+  pmrem.dispose();
+}, undefined, (err) => console.warn('day sky HDRI failed to load:', err));
 
-/* lights */
-scene.add(new THREE.HemisphereLight(0xfff1da, 0x241a12, 0.75));
-const key = new THREE.DirectionalLight(0xffe9c0, 2.1);
+/* lights — daylight */
+scene.add(new THREE.HemisphereLight(0xcfe4ff, 0x4a5a63, 1.15));
+const key = new THREE.DirectionalLight(0xfff4e2, 2.6);
 key.position.set(6.5, 12, 7);
 key.castShadow = true;
 key.shadow.mapSize.set(2048, 2048);
@@ -185,38 +230,162 @@ key.shadow.camera.far = 30;
 key.shadow.bias = -0.00035;
 key.shadow.radius = 5;
 scene.add(key);
-const fill = new THREE.DirectionalLight(0x9db8ff, 0.5);
+const fill = new THREE.DirectionalLight(0x9fc6ff, 0.7);
 fill.position.set(-8, 6, -7);
 scene.add(fill);
-const warm = new THREE.PointLight(0xffb36b, 18, 24, 1.8);
-warm.position.set(0, 5.4, 0);
-scene.add(warm);
 
-/* table — radial dark-wood glow with speckle, generated on canvas */
+/* table — rectangular modern glass table: slab, polished edge, metal legs */
+let tableGroup3D = null, tableFlat2D = null, waterSurface = null, skyCloudsGroup = null;
 {
-  const c = document.createElement('canvas');
-  c.width = c.height = 512;
-  const g = c.getContext('2d');
-  const grad = g.createRadialGradient(256, 232, 40, 256, 256, 340);
-  grad.addColorStop(0, '#2c2115');
-  grad.addColorStop(0.55, '#1b1410');
-  grad.addColorStop(1, '#0f0b08');
-  g.fillStyle = grad;
-  g.fillRect(0, 0, 512, 512);
-  for (let i = 0; i < 1400; i++) {
-    g.fillStyle = `rgba(255,228,180,${(Math.random() * 0.045).toFixed(3)})`;
-    g.fillRect(Math.random() * 512, Math.random() * 512, 1.6, 1.6);
-  }
-  const tex = new THREE.CanvasTexture(c);
-  tex.anisotropy = 4;
-  const table = new THREE.Mesh(
-    new THREE.CircleGeometry(34, 64),
-    new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95, metalness: 0.04 })
+  const W = 14, D = 12;
+  tableGroup3D = new THREE.Group();
+  scene.add(tableGroup3D);
+  const glassMat = new THREE.MeshPhysicalMaterial({
+    color: 0x39424d,
+    metalness: 0.05,
+    roughness: 0.06,
+    transmission: 0.82,
+    thickness: 0.4,
+    ior: 1.5,
+    attenuationColor: 0x111820,
+    attenuationDistance: 3.2,
+    transparent: false,
+    opacity: 1,
+    clearcoat: 1,
+    clearcoatRoughness: 0.03,
+    envMapIntensity: 1.8,
+    side: THREE.FrontSide,
+  });
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(W, 0.2, D), glassMat);
+  glass.position.y = -0.18;          // top face at -0.08, just under the board
+  glass.receiveShadow = true;
+  tableGroup3D.add(glass);
+
+  // polished bevel along all four edges catches the room reflections
+  const edgeMat = new THREE.MeshPhysicalMaterial({
+    color: 0xd8e2ee, metalness: 0.15, roughness: 0.03,
+    transmission: 0.35, transparent: false, opacity: 1,
+    clearcoat: 1, clearcoatRoughness: 0.02, envMapIntensity: 2.1,
+  });
+  const edge = (w, d, x, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, 0.22, d), edgeMat);
+    m.position.set(x, -0.18, z);
+    tableGroup3D.add(m);
+  };
+  edge(W + 0.06, 0.07, 0, D / 2);
+  edge(W + 0.06, 0.07, 0, -D / 2);
+  edge(0.07, D, W / 2, 0);
+  edge(0.07, D, -W / 2, 0);
+
+  // underlay is visible through the glass and catches the piece shadows
+  const underlay = new THREE.Mesh(
+    new THREE.BoxGeometry(W - 0.1, 0.02, D - 0.1),
+    new THREE.MeshStandardMaterial({ color: 0x171b21, roughness: 0.28, metalness: 0.35, envMapIntensity: 1.0 })
   );
-  table.rotation.x = -Math.PI / 2;
-  table.position.y = -0.42;
-  table.receiveShadow = true;
-  scene.add(table);
+  underlay.position.y = -0.29;
+  underlay.receiveShadow = true;
+  tableGroup3D.add(underlay);
+
+  // brushed-metal legs and feet make it read as a table, not a floating slab
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x343a42, metalness: 0.9, roughness: 0.16, envMapIntensity: 1.0 });
+  const footMat = new THREE.MeshStandardMaterial({ color: 0x1a1d21, metalness: 0.8, roughness: 0.25 });
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const x = sx * (W / 2 - 0.9), z = sz * (D / 2 - 0.9);
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.14, 2.6, 20), legMat);
+    leg.position.set(x, -1.55, z);
+    leg.castShadow = true;
+    tableGroup3D.add(leg);
+    const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.24, 0.08, 20), footMat);
+    foot.position.set(x, -2.94, z);
+    foot.castShadow = true;
+    tableGroup3D.add(foot);
+  }
+
+  // water surface the table stands in — reflective, gently rippling
+  const waterNormals = new THREE.TextureLoader().load('assets/waternormals.jpg');
+  waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
+  waterNormals.repeat.set(4, 4);
+  waterSurface = new Water(new THREE.PlaneGeometry(200, 200), {
+    textureWidth: 256,
+    textureHeight: 256,
+    waterNormals,
+    sunDirection: new THREE.Vector3(0.3, 0.85, 0.2).normalize(),
+    sunColor: 0xfff2d0,
+    waterColor: 0x0a55a0,
+    distortionScale: 2.2,
+    fog: true,
+  });
+  waterSurface.rotation.x = -Math.PI / 2;
+  waterSurface.position.y = -3.02;
+  tableGroup3D.add(waterSurface);
+
+  /* flat, glass-like tabletop for the orthographic 2D view. The physical glass
+     material's screen-space refraction samples white under an ortho camera. */
+  const c = document.createElement('canvas');
+  c.width = 1024; c.height = 768;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 1024, 768);
+  grad.addColorStop(0, '#151a20');
+  grad.addColorStop(0.5, '#0b0e12');
+  grad.addColorStop(1, '#181d24');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, c.width, c.height);
+  g.strokeStyle = 'rgba(255,255,255,.035)';
+  g.lineWidth = 36;
+  for (let i = -1; i < 4; i++) {
+    g.beginPath(); g.moveTo(i * 320, 0); g.lineTo(i * 320 + 260, c.height); g.stroke();
+  }
+  g.strokeStyle = 'rgba(216,180,106,.32)';
+  g.lineWidth = 3;
+  g.strokeRect(7, 7, c.width - 14, c.height - 14);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tableFlat2D = new THREE.Mesh(
+    new THREE.PlaneGeometry(W, D),
+    new THREE.MeshBasicMaterial({ map: tex })
+  );
+  tableFlat2D.rotation.x = -Math.PI / 2;
+  tableFlat2D.position.y = -0.085;
+  tableFlat2D.visible = false;
+  scene.add(tableFlat2D);
+}
+
+/* real open-source asset: CC0 mug from the Innerscene parts library */
+new GLTFLoader().load('assets/mug.glb', (gltf) => {
+  const mug = gltf.scene;
+  mug.scale.setScalar(20); // model is in metres; one chess square is 5 cm
+  const box = new THREE.Box3().setFromObject(mug);
+  mug.position.set(5.4, -0.08 - box.min.y, -3.6);
+  mug.rotation.y = -0.45;
+  mug.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = o.receiveShadow = true;
+    if (o.material) o.material.envMapIntensity = 1.2;
+  });
+  scene.add(mug);
+}, undefined, (err) => console.warn('mug asset failed to load:', err));
+
+/* drifting cloud billboards from a real CC0 cloud texture */
+{
+  const cloudTex = new THREE.TextureLoader().load('assets/cloud.png');
+  skyCloudsGroup = new THREE.Group();
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
+  for (let i = 0; i < 14; i++) {
+    const mat = new THREE.SpriteMaterial({
+      map: cloudTex, transparent: true, opacity: 0.28 + rand() * 0.22,
+      depthWrite: false, fog: false,
+    });
+    const s = new THREE.Sprite(mat);
+    const a = (i / 14) * Math.PI * 2 + rand() * 0.5;
+    const r = 24 + rand() * 18;
+    s.position.set(Math.sin(a) * r, 11 + rand() * 13, Math.cos(a) * r);
+    const size = 11 + rand() * 11;
+    s.scale.set(size * 1.9, size, 1);
+    s.userData.drift = 0.08 + rand() * 0.15;
+    skyCloudsGroup.add(s);
+  }
+  scene.add(skyCloudsGroup);
 }
 
 /* board squares */
@@ -330,8 +499,8 @@ const hlHover  = makeOverlay(0xffffff, 0.16);
 /* legal-move markers */
 const markersGroup = new THREE.Group();
 scene.add(markersGroup);
-const dotMat = new THREE.MeshBasicMaterial({ color: 0xe8c87a, transparent: true, opacity: 0.5, depthWrite: false });
-const ringMat = new THREE.MeshBasicMaterial({ color: 0xe8c87a, transparent: true, opacity: 0.6, depthWrite: false });
+const dotMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: false, opacity: 1 });
+const ringMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: false, opacity: 1 });
 const dotGeo = new THREE.CylinderGeometry(0.13, 0.13, 0.02, 24);
 const ringGeo = new THREE.TorusGeometry(0.34, 0.055, 10, 36);
 
@@ -604,7 +773,7 @@ function setRayFromEvent(e) {
   const rect = canvas.getBoundingClientRect();
   pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointerNdc, camera);
+  raycaster.setFromCamera(pointerNdc, activeCam());
 }
 function pickPiece(e) {
   setRayFromEvent(e);
@@ -632,12 +801,26 @@ function squareFromSurface(e) {
   return null;
 }
 function canInteract() {
-  if (state.over || state.engineThinking || state.pendingPromo) return false;
+  if (state.over || state.engineThinking || state.pendingPromo || state.lanMovePending) return false;
   if (state.mode === 'engine' && game.turn() !== state.playerColor) return false;
+  if (state.mode === 'lan' &&
+      !(state.lanConnected && state.lanPeer && game.turn() === state.lanColor)) return false;
   return true;
 }
 const isPromoMove = (mv) => mv.flags.includes('p');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Capture on the wrapper so OrbitControls' own canvas listener sees `enabled: false`
+// when a draggable piece was grabbed — the camera must not rotate during a drag.
+wrap.addEventListener('pointerdown', (e) => {
+  state.pendingDragHit = null;
+  if (e.target !== canvas || state.view2d || !canInteract()) return;
+  const hit = pickPiece(e);
+  if (hit && game.get(hit.userData.square)?.color === game.turn()) {
+    state.pendingDragHit = hit;
+    controls.enabled = false;
+  }
+}, true);
 
 canvas.addEventListener('pointerdown', (e) => {
   audio(); // unlock synth on first gesture
@@ -651,7 +834,8 @@ canvas.addEventListener('pointerdown', (e) => {
     if (legal) { attemptPlayerMove(legal); return; }
   }
   // 2) grabbed one of our pieces
-  const hit = pickPiece(e);
+  const hit = state.pendingDragHit || pickPiece(e);
+  state.pendingDragHit = null;
   if (hit) {
     const sq2 = hit.userData.square;
     if (game.get(sq2)?.color === game.turn()) {
@@ -688,6 +872,8 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerup', (e) => {
   const drag = state.dragging;
   state.dragging = null;
+  state.pendingDragHit = null;
+  if (!state.view2d) controls.enabled = true;
   canvas.style.cursor = 'default';
   if (!drag) return;
   if (!canInteract()) { snapBack(drag.piece, drag.fromSq); return; }
@@ -700,6 +886,8 @@ canvas.addEventListener('pointerup', (e) => {
 canvas.addEventListener('pointercancel', () => {
   const drag = state.dragging;
   state.dragging = null;
+  state.pendingDragHit = null;
+  if (!state.view2d) controls.enabled = true;
   if (drag) snapBack(drag.piece, drag.fromSq);
 });
 
@@ -733,6 +921,20 @@ function doMove(from, to, promotion) {
   // clear transient ui
   clearHintArrow();
   deselect();
+  if (state.applyingRemote && state.pendingPromo) {
+    state.pendingPromo = null;
+    $('#promo').classList.add('hidden');
+  }
+  // LAN: the server is authoritative — send the intent and wait for its echo.
+  // Never mutate the local board ourselves (promotion choices flow through here too).
+  if (state.mode === 'lan' && !state.applyingRemote) {
+    if (!lanSend({ t: 'move', from, to, promotion })) {
+      showToast('LAN connection lost — move not sent');
+      return false;
+    }
+    state.lanMovePending = true; // block a second submission until the echo arrives
+    return true;
+  }
   let mv;
   try {
     mv = game.move({ from, to, promotion });
@@ -798,29 +1000,29 @@ function doMove(from, to, promotion) {
   if (givesCheck) { sfx.check(); showToast('Check!'); }
 
   refreshUI();
+  liveAnalyze();                 // queue final-position eval before any game-end recording
   const ended = checkGameEnd();
-  liveAnalyze();
   if (!ended) maybeRequestEngine();
   return true;
 }
 
 function checkGameEnd() {
-  const over = game.isGameOver();
-  if (!over) return false;
+  if (state.over || !game.isGameOver()) return false;
   state.over = true;
   state.engineThinking = false;
   thinkingEl.classList.add('hidden');
+  // compute once for every ending (null for draws)
+  state.winnerColor = game.isCheckmate() ? (game.turn() === 'w' ? 'b' : 'w') : null;
 
-  let title = 'Game over', sub = '', glyph = '♛';
+  let title = 'Game over', sub = '', glyph = '';
   if (game.isCheckmate()) {
-    state.winnerColor = game.turn() === 'w' ? 'b' : 'w';
     const winner = state.winnerColor === 'w' ? 'White' : 'Black';
     title = 'Checkmate';
     sub = state.mode === 'engine'
-      ? (winner === 'White' ? (state.playerColor === 'w' ? 'White wins — you beat Stockfish!' : 'White wins — Stockfish triumphs')
-                            : (state.playerColor === 'b' ? 'Black wins — you beat Stockfish!' : 'Black wins — Stockfish triumphs'))
+      ? (winner === 'White' ? (state.playerColor === 'w' ? 'White wins — you beat FENTSTEIN-TEHN!' : 'White wins — FENTSTEIN-TEHN triumphs')
+                            : (state.playerColor === 'b' ? 'Black wins — you beat FENTSTEIN-TEHN!' : 'Black wins — FENTSTEIN-TEHN triumphs'))
       : `${winner} wins`;
-    glyph = '👑';
+    glyph = '';
   } else if (game.isStalemate()) { title = 'Draw'; sub = 'Stalemate — no legal moves'; }
   else if (game.isThreefoldRepetition()) { title = 'Draw'; sub = 'Threefold repetition'; }
   else if (game.isInsufficientMaterial()) { title = 'Draw'; sub = 'Insufficient mating material'; }
@@ -833,15 +1035,18 @@ function checkGameEnd() {
   sfx.end();
   if (game.isCheckmate()) spawnVictoryBurst();
   if (state.mode === 'engine') {
+    // Write the result immediately; the entry is refined later if the remaining
+    // positions finish analysing (see finishPendingRecord).
     if (game.isCheckmate()) {
       const winner = game.turn() === 'w' ? 'b' : 'w';
       if (winner === state.playerColor) record.w++; else record.l++;
-    } else {
-      record.d++;
-    }
+    } else record.d++;
     try { localStorage.setItem(RECORD_KEY, JSON.stringify(record)); } catch { /* private mode */ }
     renderRecord();
-    recordProfileEntry();
+    state.recordTs = Date.now();
+    recordProfileEntry(state.recordTs);
+    state.recordWritten = true;
+    enqueueGameAnalysisForRecord();
   }
   refreshUI();
   return true;
@@ -885,7 +1090,11 @@ function handleEngineLine(line) {
   }
   if (line.startsWith('readyok')) {
     state.engineReady = true;
-    footState.textContent = `stockfish 19 lt · ${currentDiff().label.toLowerCase()}`;
+    if (state.mode === 'engine') footState.textContent = `fentstein-tehn · ${currentDiff().label.toLowerCase()}`;
+    if (state.mode === 'engine' && state.playerColor === 'b' && !game.history().length && !state.over) {
+      if (state.blackTimer) clearTimeout(state.blackTimer);
+      state.blackTimer = setTimeout(() => { state.blackTimer = null; maybeRequestEngine(); }, 350);
+    }
     return;
   }
   if (line.startsWith('info')) {
@@ -895,19 +1104,33 @@ function handleEngineLine(line) {
   }
   if (line.startsWith('bestmove')) {
     const mv = line.split(/\s+/)[1];
-    state.engineThinking = false;
-    thinkingEl.classList.add('hidden');
-    if (state.hintThinking) {
-      state.hintThinking = false;
+    const wasHint = state.hintThinking;
+    const token = wasHint ? state.hintToken : state.engineToken;
+    if (wasHint) state.hintThinking = false;
+    else state.engineThinking = false;
+    // Any reply whose token is stale belongs to a search invalidated by New Game,
+    // Undo, or a newer request — never apply it to the current position.
+    if (token == null || token !== state.engineGen) {
+      // A hint superseded by a player move must re-arm the engine search, otherwise
+      // the game freezes with the player stuck on the engine's turn.
+      if (wasHint && !state.over && state.mode === 'engine' && game.turn() !== state.playerColor) maybeRequestEngine();
+      return;
+    }
+    if (!state.engineThinking) thinkingEl.classList.add('hidden');
+
+    if (wasHint) {
       // only draw if the position is still what we asked about (user may have moved/undone)
       if (mv && mv !== '(none)' && game.fen() === state.hintFen) {
         drawHintArrow(mv.slice(0, 2), mv.slice(2, 4));
-        showToast('Stockfish suggests ' + mv.slice(0, 2) + ' → ' + mv.slice(2, 4));
+        showToast('FENTSTEIN-TEHN suggests ' + mv.slice(0, 2) + ' → ' + mv.slice(2, 4));
         sfx.select();
       }
+      if (!state.over && state.mode === 'engine' && game.turn() !== state.playerColor) maybeRequestEngine();
       return;
     }
-    if (!mv || mv === '(none)') { checkGameEnd(); return; }
+    if (state.engineSearchFen && game.fen() !== state.engineSearchFen) return;
+    state.engineSearchFen = null;
+    if (!mv || mv === '(none)') { if (!state.over) checkGameEnd(); return; }
     const from = mv.slice(0, 2), to = mv.slice(2, 4), promotion = mv.length > 4 ? mv[4] : undefined;
     doMove(from, to, promotion);
   }
@@ -932,13 +1155,17 @@ function updateEvalBarFromHistory() {
 
 function maybeRequestEngine() {
   if (state.mode !== 'engine') return;
+  if (!engine || !state.engineReady) return;
   if (game.isGameOver()) return;
+  if (state.engineThinking || state.hintThinking) return;
   if (game.turn() === state.playerColor) return;
   state.engineThinking = true;
   state.evalSide = game.turn();
+  state.engineSearchFen = game.fen();
+  state.engineToken = ++state.engineGen;
   thinkingEl.classList.remove('hidden');
   engineSend('ucinewgame');
-  engineSend('position fen ' + game.fen());
+  engineSend('position fen ' + state.engineSearchFen);
   engineSend('go depth ' + currentDiff().depth);
 }
 
@@ -999,6 +1226,7 @@ function pumpAnalysisQueue() {
   const item = state.analysisQueue.shift();
   if (!item) {
     if (state.deepAnalysis) finishDeepAnalysis();
+    if (state.recordPending) finishPendingRecord();
     return;
   }
   if (item.gen !== state.gen) { pumpAnalysisQueue(); return; }
@@ -1023,6 +1251,34 @@ function liveAnalyze() {
   cancelQueuedAnalysis();               // moves invalidate queued work; keep played positions' evals
   const ply = game.history().length;
   enqueueAnalysis({ gen: state.gen, ply, turn: game.turn(), fen: game.fen(), depth: 8 });
+}
+/* Finish a game's tracking only once the final position has been analysed, so the
+   last move is not silently dropped from tags / accuracy / phase stats. */
+function enqueueGameAnalysisForRecord() {
+  state.recordGen = state.gen;
+  state.recordPending = true;
+  if (!analyzer) { finishPendingRecord(); return; }
+  const scratch = new Chess();
+  const positions = [{ fen: scratch.fen(), turn: 'w' }];
+  for (const mv of game.history()) {
+    try { scratch.move(mv); } catch { break; }
+    positions.push({ fen: scratch.fen(), turn: scratch.turn() });
+  }
+  for (let i = 0; i < positions.length; i++) {
+    if (state.evalHistory[i] != null) continue;
+    enqueueAnalysis({ gen: state.gen, ply: i, turn: positions[i].turn, fen: positions[i].fen, depth: 8 });
+  }
+  pumpAnalysisQueue();
+}
+function finishPendingRecord() {
+  if (!state.recordPending) return;
+  state.recordPending = false;
+  if (state.gen !== state.recordGen || !state.over || state.mode !== 'engine' || !game.isGameOver()) return;
+  // The result was already recorded at game end; only replace the entry with a
+  // fully-analysed version so the last move is included in its stats.
+  computeTags();
+  state.lastAcc = computeAccuracies();
+  recordProfileEntry(state.recordTs);
 }
 function resetAnalytics() {
   cancelQueuedAnalysis();
@@ -1054,7 +1310,8 @@ function toggleDeepAnalyze() {
     showToast('Deep analysis cancelled');
     return;
   }
-  if (!analyzer) { showToast('Stockfish analysis unavailable'); return; }
+  if (!analyzer) { showToast('Analysis unavailable'); return; }
+  if (state.recordPending) finishPendingRecord(); // don't drop a just-finished game's refinement
   cancelQueuedAnalysis();
   state.deepAnalysis = true;
   state.deepDone = 0;
@@ -1081,10 +1338,10 @@ function updateAnalyzeButton() {
   if (!btnAnalyze) return;
   if (state.deepAnalysis) {
     const total = game.history().length + 1;
-    btnAnalyze.textContent = `Analyzing ${Math.min(state.deepDone, total)}/${total}…`;
+    btnAnalyze.textContent = `Analyzing ${Math.min(state.deepDone, total)}/${total}`;
     btnAnalyze.disabled = false; // click to cancel
   } else {
-    btnAnalyze.textContent = 'Deep Analyze';
+    btnAnalyze.textContent = 'Analyze';
     btnAnalyze.disabled = false;
   }
 }
@@ -1162,6 +1419,7 @@ function computeTags() {
     if (before == null || after == null) continue;
     const sign = hist[i - 1].color === 'w' ? 1 : -1;
     const loss = sign * (before - after); // cp lost by the mover (positive = bad)
+    if (loss > 10000) continue; // mate swing — no meaningful tag
     let tag = null;
     if (loss >= 300) tag = '??';
     else if (loss >= 150) tag = '?';
@@ -1181,7 +1439,9 @@ function computeAccuracies() {
     if (before == null || after == null) continue;
     const mover = hist[i - 1].color;
     const sign = mover === 'w' ? 1 : -1;
-    const loss = Math.max(0, sign * (before - after)); // cp lost
+    const swing = sign * (before - after);
+    if (swing > 10000) continue; // mate swing — not a usable accuracy sample
+    const loss = Math.max(0, swing); // cp lost
     acc[mover].push(100 * Math.exp(-0.0008 * loss));
     const tag = state.moveTags[i - 1];
     if (tag === '?' || tag === '??') mis[mover]++;
@@ -1388,16 +1648,22 @@ function refreshMatchup() {
   const turn = game.turn();
   const over = state.over;
   const isEngine = state.mode === 'engine';
-  const pCol = state.playerColor;
+  const isLan = state.mode === 'lan';
+  const pCol = isLan ? state.lanColor : state.playerColor;
   const nameFor = (side) => {
+    if (isLan) return side === pCol && pCol ? 'You' : (side === 'w' ? 'White' : 'Black');
     if (!isEngine) return side === 'w' ? 'White Player' : 'Black Player';
-    return side === pCol ? 'You' : 'Stockfish 19';
+    return side === pCol ? 'You' : 'FENTSTEIN-TEHN';
   };
   const subFor = (side) => {
     const color = side === 'w' ? 'White' : 'Black';
+    if (isLan) return color + (side === pCol && pCol ? ' · You (LAN)' : ' · Opponent (LAN)');
     if (!isEngine) return color + ' · Local';
-    return color + (side === pCol ? ' · You' : ' · Engine') + ' · ' + currentDiff().label;
+    return color + (side === pCol ? ' · You' : ' · FENTSTEIN-TEHN') + ' · ' + currentDiff().label;
   };
+  const avatarFor = (side) => (isEngine && side !== pCol ? 'assets/fentstein.jpg' : 'assets/userr.jpg');
+  if (avW) { avW.src = avatarFor('w'); avW.alt = isEngine && pCol !== 'w' ? 'FENTSTEIN-TEHN' : 'User'; }
+  if (avB) { avB.src = avatarFor('b'); avB.alt = isEngine && pCol !== 'b' ? 'FENTSTEIN-TEHN' : 'User'; }
   mNameW.textContent = nameFor('w');
   mSubW.textContent = subFor('w');
   mNameB.textContent = nameFor('b');
@@ -1527,26 +1793,255 @@ function applySettings() {
   state.preferredColor = s.preferredColor ?? 'w';
   state.sound = s.sound ?? true;
   state.flipped = !!s.flipped;
+  state.view2d = !!s.view2d;
 }
 function saveSettings() {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
       mode: state.mode, difficulty: state.difficulty,
-      preferredColor: state.preferredColor, sound: state.sound, flipped: state.flipped,
+      preferredColor: state.preferredColor, sound: state.sound,
+      flipped: state.flipped, view2d: state.view2d,
     }));
   } catch { /* private mode */ }
 }
 function renderRecord() {
   const el = $('#record-line');
-  if (el) el.innerHTML = `Record vs Stockfish · <b>${record.w}W</b> · ${record.d}D · <b>${record.l}L</b>`;
+  if (el) el.innerHTML = `Record vs FENTSTEIN-TEHN · <b>${record.w}W</b> · ${record.d}D · <b>${record.l}L</b>`;
 }
 function syncSettingsUI() {
   $('#mode-seg').querySelectorAll('.seg').forEach((b) => b.classList.toggle('active', b.dataset.mode === state.mode));
   $('#color-seg').querySelectorAll('.seg').forEach((b) => b.classList.toggle('active', b.dataset.color === state.preferredColor));
   diffGrid.querySelectorAll('.diff-btn').forEach((b) => b.classList.toggle('active', b.dataset.id === state.difficulty));
-  $('#btn-sound').textContent = state.sound ? '🔊' : '🔇';
-  footState.textContent = state.mode === 'engine' ? `stockfish 19 lt · ${currentDiff().label.toLowerCase()}` : 'two-player mode';
+  $('#btn-sound').textContent = state.sound ? 'Sound On' : 'Sound Off';
+  const lanCard = $('#lan-card');
+  if (lanCard) lanCard.classList.toggle('hidden', state.mode !== 'lan');
+  $('#engine-opts').style.display = state.mode === 'engine' ? 'block' : 'none';
   $('#record-line').style.display = state.mode === 'engine' ? 'block' : 'none';
+  const viewBtn = $('#btn-view');
+  if (viewBtn) viewBtn.textContent = state.view2d ? '3D' : '2D';
+  if (state.mode === 'lan') {
+    footState.textContent = `lan · ${state.lanCode ? 'room ' + state.lanCode : 'not connected'}`;
+  } else {
+    footState.textContent = state.mode === 'engine'
+      ? `fentstein-tehn · ${currentDiff().label.toLowerCase()}` : 'two-player mode';
+  }
+}
+
+/* ============================================================
+   11.6 · LAN MULTIPLAYER (WebSocket rooms on /lan)
+   ============================================================ */
+function lanFillHost() {
+  const el = $('#lan-host');
+  if (el) el.textContent = location.host || 'this host';
+}
+function lanStatus(text, on) {
+  const el = $('#lan-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('lan-status-on', !!on);
+  el.classList.toggle('lan-status-off', !on);
+}
+function lanCancelEngine() {
+  // A Stockfish search started in another mode must never inject a move into a LAN game.
+  engineSend('stop');
+  state.engineGen++;
+  state.engineToken = state.hintToken = null;
+  state.engineThinking = false;
+  state.hintThinking = false;
+  state.engineSearchFen = null;
+  if (state.blackTimer) { clearTimeout(state.blackTimer); state.blackTimer = null; }
+  thinkingEl.classList.add('hidden');
+}
+function lanTurnStatus() {
+  if (!state.lanPeer) { lanStatus('Waiting for opponent…', state.lanConnected); return; }
+  const side = game.turn() === 'w' ? 'White' : 'Black';
+  const mine = game.turn() === state.lanColor;
+  lanStatus(`${side} to move — ${mine ? 'your move' : "opponent's move"}`, true);
+}
+function lanSend(obj) {
+  const ws = state.lanSocket;
+  if (!ws || ws.readyState !== ws.OPEN) return false;
+  try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+function lanDisconnect() {
+  const ws = state.lanSocket;
+  state.lanSocket = null;
+  state.lanConnected = false;
+  state.lanPeer = false;
+  state.lanColor = null;
+  state.lanMovePending = false;
+  if (ws) {
+    ws._lanClosing = true; // intentional close — don't show "connection lost"
+    try { ws.close(); } catch (_) {}
+  }
+}
+function lanConnect(mode, code) {
+  lanDisconnect();
+  state.lanCode = null;
+  const codeEl = $('#lan-code');
+  if (codeEl) codeEl.textContent = '—';
+  lanFillHost();
+  lanStatus('Connecting…', false);
+  syncSettingsUI();
+
+  let ws;
+  try {
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/lan');
+  } catch (_) {
+    lanStatus('Connection failed', false);
+    showToast('Could not open LAN connection');
+    return;
+  }
+  state.lanSocket = ws;
+  let toasted = false; // at most one disconnect toast per attempt
+
+  const dropped = () => {
+    if (state.lanSocket === ws) {
+      state.lanSocket = null;
+      state.lanConnected = false;
+      state.lanPeer = false;
+      state.lanColor = null;
+      lanStatus('Not connected', false);
+      syncSettingsUI();
+    }
+    if (!ws._lanClosing && !toasted) {
+      toasted = true;
+      showToast('LAN connection lost');
+    }
+  };
+
+  ws.onopen = () => {
+    if (state.lanSocket !== ws) return;
+    lanSend(mode === 'join' ? { t: 'join', code } : { t: 'create' });
+  };
+  ws.onerror = dropped;
+  ws.onclose = dropped;
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (!msg || typeof msg !== 'object') return;
+    if (state.lanSocket !== ws) return; // stale socket — ignore late messages
+
+    switch (msg.t) {
+      case 'joined': {
+        state.lanCode = msg.code ?? null;
+        state.lanColor = msg.color === 'b' ? 'b' : 'w';
+        state.lanConnected = true;
+        state.lanPeer = !msg.waiting;
+        if (codeEl) codeEl.textContent = msg.code || '—';
+        lanFillHost();
+        const side = state.lanColor === 'w' ? 'White' : 'Black';
+        lanStatus(msg.waiting
+          ? `Connected as ${side} — waiting for opponent…`
+          : `Connected as ${side} — opponent joined`, true);
+        syncSettingsUI();
+        showToast(msg.waiting ? `Room ${msg.code} — waiting for opponent` : `Joined room ${msg.code}`);
+        break;
+      }
+
+      case 'start': {
+        lanCancelEngine();
+        state.lanMovePending = false;
+        // server snapshot is authoritative
+        game.load(msg.fen);
+        resetAnalytics();
+        state.moveTimes = [];
+        state.turnStartedAt = Date.now();
+        state.over = false;
+        state.winnerColor = null;
+        state.lastAcc = null;
+        state.recordPending = false;
+        state.recordWritten = false;
+        state.recordTs = null;
+        state.engineThinking = false;
+        state.hintThinking = false;
+        state.selected = null;
+        state.legalTargets = [];
+        state.lastMove = null;
+        state.pendingPromo = null;
+        clearHintArrow();
+        clearMarkers();
+        $('#gameover').classList.add('hidden');
+        $('#promo').classList.add('hidden');
+        thinkingEl.classList.add('hidden');
+        syncFromBoard();
+        refreshUI();
+        liveAnalyze();          // analysis only — never start the engine in LAN play
+        state.lanPeer = true;
+        lanTurnStatus();
+        showToast('Opponent joined — game started');
+        break;
+      }
+
+      case 'move': {
+        state.lanMovePending = false;
+        state.applyingRemote = true;
+        try {
+          let applied = false;
+          try { applied = doMove(msg.from, msg.to, msg.promotion); } catch (_) { applied = false; }
+          if (!applied || (msg.fen && game.fen() !== msg.fen)) {
+            // out-of-sync echo: rebuild from the initial position and replay SAN
+            game.reset();
+            let rebuilt = true;
+            try { for (const san of msg.history || []) game.move(san); } catch { rebuilt = false; }
+            if (!rebuilt || (msg.fen && game.fen() !== msg.fen)) { if (msg.fen) game.load(msg.fen); }
+            syncFromBoard();
+            refreshOverlays();
+            refreshUI();
+          }
+        } finally {
+          state.applyingRemote = false;
+          lanTurnStatus();
+        }
+        break;
+      }
+
+      case 'reset': {
+        lanCancelEngine();
+        state.lanMovePending = false;
+        game.load(new Chess().fen());
+        resetAnalytics();
+        state.moveTimes = [];
+        state.turnStartedAt = Date.now();
+        state.over = false;
+        state.winnerColor = null;
+        state.lastAcc = null;
+        state.recordPending = false;
+        state.recordWritten = false;
+        state.recordTs = null;
+        state.engineThinking = false;
+        state.hintThinking = false;
+        state.selected = null;
+        state.legalTargets = [];
+        state.lastMove = null;
+        state.pendingPromo = null;
+        clearHintArrow();
+        clearMarkers();
+        $('#gameover').classList.add('hidden');
+        $('#promo').classList.add('hidden');
+        thinkingEl.classList.add('hidden');
+        syncFromBoard();
+        refreshUI();
+        liveAnalyze();
+        lanTurnStatus();
+        showToast('New LAN game');
+        break;
+      }
+
+      case 'error':
+        state.lanMovePending = false; // server rejected the move; allow a retry
+        showToast(msg.msg || 'LAN error');
+        break;
+
+      case 'peer-left':
+        state.lanPeer = false;
+        state.lanMovePending = false;
+        lanStatus('Opponent left', false);
+        showToast('Opponent left the game');
+        break;
+    }
+  };
 }
 
 /* golden arrow showing Stockfish's recommended move */
@@ -1586,15 +2081,17 @@ function drawHintArrow(from, to) {
 }
 
 function requestHint() {
+  if (state.mode === 'lan') { showToast('Engine hints are disabled in LAN play'); return; }
   if (state.over) return;
-  if (!engine || !state.engineReady) { showToast('Stockfish still loading…'); return; }
-  if (state.engineThinking) { showToast('Wait for Stockfish to move…'); return; }
+  if (!engine || !state.engineReady) { showToast('FENTSTEIN-TEHN still loading…'); return; }
+  if (state.engineThinking) { showToast('Wait for FENTSTEIN-TEHN to move…'); return; }
   if (state.hintThinking) return;
   state.hintThinking = true;
   state.hintFen = game.fen();
-  engineSend('position fen ' + game.fen());
+  state.hintToken = ++state.engineGen;
+  engineSend('position fen ' + state.hintFen);
   engineSend('go depth 12');
-  showToast('Consulting Stockfish…');
+  showToast('Consulting FENTSTEIN-TEHN…');
   sfx.select();
 }
 
@@ -1628,6 +2125,18 @@ function spawnVictoryBurst() {
    12 · CONTROLS & GAME FLOW
    ============================================================ */
 function newGame() {
+  if (state.mode === 'lan') {
+    // clear local transient UI only; the room's reset is authoritative
+    clearHintArrow();
+    deselect();
+    state.pendingPromo = null;
+    $('#promo').classList.add('hidden');
+    $('#gameover').classList.add('hidden');
+    thinkingEl.classList.add('hidden');
+    if (state.lanConnected && state.lanSocket) lanSend({ t: 'reset' });
+    else lanConnect('create');
+    return;
+  }
   game.reset();
   state.over = false;
   state.engineThinking = false;
@@ -1638,6 +2147,12 @@ function newGame() {
   state.hintThinking = false;
   state.winnerColor = null;
   state.lastAcc = null;
+  state.recordPending = false;
+  state.recordWritten = false;
+  if (state.blackTimer) { clearTimeout(state.blackTimer); state.blackTimer = null; }
+  state.engineGen++; // invalidate every in-flight engine / hint reply
+  state.engineToken = state.hintToken = null;
+  state.engineSearchFen = null;
   clearHintArrow();
   state.playerColor =
     state.preferredColor === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : state.preferredColor;
@@ -1648,7 +2163,9 @@ function newGame() {
   resetAnalytics();
   state.moveTimes = [];
   state.turnStartedAt = Date.now();
+  state.gameDifficulty = state.difficulty;
   syncFromBoard();
+  engineSend('stop');
   engineSend('ucinewgame');
   evalFill.style.height = '50%';
   evalLabel.textContent = '–';
@@ -1657,20 +2174,41 @@ function newGame() {
   sfx.start();
   liveAnalyze();
   if (state.mode === 'engine' && state.playerColor === 'b') {
-    setTimeout(maybeRequestEngine, 350);
+    state.blackTimer = setTimeout(() => { state.blackTimer = null; maybeRequestEngine(); }, 350);
   }
 }
 
 function undo() {
+  if (state.mode === 'lan') { showToast('Undo is not available in LAN play'); return; }
   if (state.pendingPromo) return;
   engineSend('stop');
+  if (state.blackTimer) { clearTimeout(state.blackTimer); state.blackTimer = null; }
+  state.engineGen++; // invalidate every in-flight engine / hint reply
+  state.engineToken = state.hintToken = null;
+  state.engineSearchFen = null;
   state.engineThinking = false;
   state.hintThinking = false;
+  state.recordPending = false;
   clearHintArrow();
   thinkingEl.classList.add('hidden');
   const wasOver = state.over;
   state.over = false;
+  state.winnerColor = null;
   $('#gameover').classList.add('hidden');
+  if (wasOver && state.mode === 'engine' && state.recordWritten) {
+    // undo the entry + record increment written for the just-finished game
+    const profile = loadProfile();
+    const entry = profile.pop();
+    if (entry) {
+      saveProfile(profile); // keeps all older entries intact
+      const key = entry.result === 'draw' ? 'd' : (entry.result === entry.pCol ? 'w' : 'l');
+      record[key] = Math.max(0, (record[key] || 0) - 1);
+      try { localStorage.setItem(RECORD_KEY, JSON.stringify(record)); } catch { /* private mode */ }
+      renderRecord();
+      refreshProfile();
+    }
+  }
+  state.recordWritten = false;
   if (state.mode === 'engine') {
     // rewind until it's the player's move again
     for (let i = 0; i < 2; i++) {
@@ -1696,15 +2234,23 @@ function setFlipped(flipped) {
   state.flipped = flipped;
   clearHintArrow();
   saveSettings();
+  updateOrthoUp(); // the top-down view flips with the board
   const z = flipped ? -11.8 : 11.8;
   const tz = flipped ? -1.35 : 1.35;
-  camTween = {
-    fromPos: camera.position.clone(),
-    toPos: new THREE.Vector3(0, 8.8, z),
-    fromTarget: controls.target.clone(),
-    toTarget: new THREE.Vector3(0, 0, tz),
-    t: 0,
-  };
+  if (state.view2d) {
+    // stay top-down, but remember the 3D pose for when we switch back
+    camTween = null;
+    camera.position.set(0, 8.8, z);
+    controls.target.set(0, 0, tz);
+  } else {
+    camTween = {
+      fromPos: camera.position.clone(),
+      toPos: new THREE.Vector3(0, 8.8, z),
+      fromTarget: controls.target.clone(),
+      toTarget: new THREE.Vector3(0, 0, tz),
+      t: 0,
+    };
+  }
   // knight facing must follow the flip
   for (const sq of Object.keys(pieces)) {
     const p = pieces[sq];
@@ -1713,6 +2259,30 @@ function setFlipped(flipped) {
       p.rotation.y = (w !== flipped) ? Math.PI / 2 : -Math.PI / 2;
     }
   }
+}
+
+/* top-down orthographic view of the same board, or the normal 3D camera */
+function setView2d(on) {
+  state.view2d = !!on;
+  if (tableGroup3D) tableGroup3D.visible = !state.view2d;
+  if (tableFlat2D) tableFlat2D.visible = state.view2d;
+  if (skyCloudsGroup) skyCloudsGroup.visible = !state.view2d;
+  const btn = $('#btn-view');
+  if (btn) btn.textContent = state.view2d ? '3D' : '2D';
+  controls.enabled = !state.view2d;
+  controls.enableRotate = !state.view2d;
+  camTween = null;
+  updateOrthoUp();
+  resize();
+  if (!state.view2d) {
+    // restore the normal 3D pose for the current flip (same pose as setFlipped)
+    const z = state.flipped ? -11.8 : 11.8;
+    const tz = state.flipped ? -1.35 : 1.35;
+    camera.position.set(0, 8.8, z);
+    controls.target.set(0, 0, tz);
+    controls.update();
+  }
+  saveSettings();
 }
 
 /* difficulty grid */
@@ -1726,7 +2296,7 @@ for (const d of DIFFS) {
     state.difficulty = d.id;
     diffGrid.querySelectorAll('.diff-btn').forEach((b) => b.classList.toggle('active', b === btn));
     applyDifficultyOption();
-    footState.textContent = `stockfish 19 lt · ${d.label.toLowerCase()}`;
+    footState.textContent = `fentstein-tehn · ${d.label.toLowerCase()}`;
     saveSettings();
   });
   diffGrid.appendChild(btn);
@@ -1735,8 +2305,27 @@ for (const d of DIFFS) {
 /* mode + color segmented controls */
 $('#mode-seg').addEventListener('click', (e) => {
   const btn = e.target.closest('.seg'); if (!btn) return;
+  const prevMode = state.mode;
   state.mode = btn.dataset.mode;
   $('#mode-seg').querySelectorAll('.seg').forEach((b) => b.classList.toggle('active', b === btn));
+  if (state.mode === 'lan') {
+    lanCancelEngine();
+    lanDisconnect();
+    state.lanCode = null;
+    const codeEl = $('#lan-code');
+    if (codeEl) codeEl.textContent = '—';
+    lanFillHost();
+    $('#lan-card').classList.remove('hidden');
+    $('#engine-opts').style.display = 'none';
+    lanStatus('Not connected — create or join a game', false);
+    syncSettingsUI();
+    saveSettings();
+    return; // no engine boot / newGame() in LAN mode
+  }
+  if (prevMode === 'lan') {
+    lanDisconnect();
+    $('#lan-card').classList.add('hidden');
+  }
   syncSettingsUI();
   saveSettings();
   newGame();
@@ -1752,12 +2341,31 @@ $('#btn-new').addEventListener('click', newGame);
 $('#btn-hint').addEventListener('click', requestHint);
 $('#btn-analyze').addEventListener('click', toggleDeepAnalyze);
 $('#btn-flip').addEventListener('click', () => setFlipped(!state.flipped));
+$('#btn-view').addEventListener('click', () => setView2d(!state.view2d));
 $('#btn-undo').addEventListener('click', undo);
 $('#btn-sound').addEventListener('click', () => {
   state.sound = !state.sound;
-  $('#btn-sound').textContent = state.sound ? '🔊' : '🔇';
+  $('#btn-sound').textContent = state.sound ? 'Sound On' : 'Sound Off';
   saveSettings();
   if (state.sound) sfx.select();
+});
+$('#lan-create').addEventListener('click', () => lanConnect('create'));
+$('#lan-join').addEventListener('click', () => {
+  const input = $('#lan-join-code');
+  const code = ((input?.value) || '').trim().toUpperCase();
+  if (!code) { showToast('Enter a room code first'); input?.focus(); return; }
+  lanConnect('join', code);
+});
+$('#lan-copy').addEventListener('click', async () => {
+  if (!state.lanCode) { showToast('No room code yet'); return; }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(state.lanCode);
+      showToast('Room code copied: ' + state.lanCode);
+      return;
+    }
+  } catch (_) { /* clipboard blocked — fall back to showing the code */ }
+  showToast('Room code: ' + state.lanCode);
 });
 window.addEventListener('keydown', (e) => {
   if (e.repeat) return;
@@ -1767,6 +2375,7 @@ window.addEventListener('keydown', (e) => {
   else if (k === 'u') undo();
   else if (k === 'h') requestHint();
   else if (k === 'm') $('#btn-sound').click();
+  else if (k === 'v' && !/^(INPUT|TEXTAREA)$/.test(e.target?.tagName || '')) setView2d(!state.view2d);
 });
 $('#gameover-again').addEventListener('click', newGame);
 
@@ -1776,8 +2385,23 @@ $('#gameover-again').addEventListener('click', newGame);
 function resize() {
   const w = wrap.clientWidth, h = wrap.clientHeight;
   renderer.setSize(w, h, false);
-  camera.aspect = w / h;
+  const aspect = w / h;
+  camera.aspect = aspect;
   camera.updateProjectionMatrix();
+  // orthographic frustum: keep square pixels and fit the whole board in either orientation
+  const half = 5.1;
+  if (aspect < 1) {
+    orthoCam.left = -half;
+    orthoCam.right = half;
+    orthoCam.top = half / aspect;
+    orthoCam.bottom = -half / aspect;
+  } else {
+    orthoCam.left = -half * aspect;
+    orthoCam.right = half * aspect;
+    orthoCam.top = half;
+    orthoCam.bottom = -half;
+  }
+  orthoCam.updateProjectionMatrix();
   drawEvalGraph();
   drawWpGraph();
   drawMaterialGraph();
@@ -1788,6 +2412,13 @@ const clock = new THREE.Clock();
 function tick() {
   requestAnimationFrame(tick);
   const dt = Math.min(clock.getDelta(), 0.05);
+  if (waterSurface && tableGroup3D.visible) waterSurface.material.uniforms.time.value += dt * 0.35;
+  if (skyCloudsGroup && skyCloudsGroup.visible && !state.view2d) {
+    for (const s of skyCloudsGroup.children) {
+      s.position.x += dt * s.userData.drift;
+      if (s.position.x > 55) s.position.x = -55;
+    }
+  }
 
   // camera flip tween
   if (camTween) {
@@ -1851,7 +2482,7 @@ function tick() {
     }
   }
 
-  renderer.render(scene, camera);
+  renderer.render(scene, activeCam());
 }
 
 /* Debug/test hook: project a square to viewport pixels */
@@ -1859,7 +2490,7 @@ window.__royal = {
   toScreen(sq) {
     const rect = canvas.getBoundingClientRect();
     const p = sqToWorld(sq);
-    const v = new THREE.Vector3(p.x, SURF_Y, p.z).project(camera);
+    const v = new THREE.Vector3(p.x, SURF_Y, p.z).project(activeCam());
     return { x: rect.left + (v.x * 0.5 + 0.5) * rect.width, y: rect.top + (-v.y * 0.5 + 0.5) * rect.height };
   },
   fen: () => game.fen(),
@@ -1871,12 +2502,18 @@ window.__royal = {
    ============================================================ */
 applySettings();
 syncSettingsUI();
+state.gameDifficulty = state.difficulty; // freeze the level for the first game after load
+state.playerColor = state.preferredColor === 'random'
+  ? (Math.random() < 0.5 ? 'w' : 'b') : state.preferredColor;
 renderRecord();
+lanFillHost();
+if (state.mode === 'lan') lanStatus('Not connected — create or join a game', false); // no auto-connect
 if (state.flipped) {
   camera.position.set(0, 8.8, -11.8);
   controls.target.set(0, 0, -1.35);
 }
 resize();
+if (state.view2d) setView2d(true); // restore the saved top-down view
 syncFromBoard();
 refreshUI();
 refreshProfile();
@@ -1982,7 +2619,7 @@ function coachContext() {
   ].join('\n');
 }
 
-const COACH_SYSTEM = `You are Royal Coach — the personal chess coach inside Royal 3D Chess. You can SEE this game: every position arrives as FEN plus SAN move list, whose turn it is, Stockfish's evaluation, material balance and the opening. Your job:
+const COACH_SYSTEM = `You are Royal Coach — the personal chess coach inside Royal 3D Chess. You can SEE this game: every position arrives as FEN plus SAN move list, whose turn it is, FENTSTEIN-TEHN's evaluation, material balance and the opening. Your job:
 - Give warm, direct, expert advice based ONLY on the actual position. Never invent a position.
 - Be concise: 2-6 sentences for most questions. Use short lists only when comparing options.
 - Suggest concrete moves in SAN notation, always grounded in the FEN and moves given.
@@ -2038,7 +2675,7 @@ function showCoachThinking() {
 }
 function clearCoachThread() {
   coachThread.innerHTML = '';
-  appendCoachMessage('coach', "♞ Welcome to the royal table. I can see your game — the position, every move, the evaluation. The key fields below are already open: paste your OpenAI-compatible key, press Save key, then ask anything — why your last move was wrong, what to play next, or just talk.");
+  appendCoachMessage('coach', "I can see your game — the position, every move, the evaluation. To start, paste your OpenAI-compatible key below, press Save key, then ask anything: why your last move was wrong, what to play next, or what to study.");
 }
 
 async function coachSendMessage(text) {
@@ -2172,7 +2809,25 @@ tick();
 
 function loadProfile() {
   const d = loadLS(PROFILE_KEY, []);
-  return Array.isArray(d) ? d.slice(-MAX_PROFILE_GAMES) : [];
+  if (!Array.isArray(d)) return [];
+  // drop non-finite numbers anywhere in an entry (including nested stat buckets)
+  const finiteNumbers = (obj) => {
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (typeof v === 'number' && !Number.isFinite(v)) delete obj[k];
+      else if (v && typeof v === 'object' && !Array.isArray(v)) finiteNumbers(v);
+    }
+    return obj;
+  };
+  return d.slice(-MAX_PROFILE_GAMES)
+    .filter((x) => x && typeof x === 'object' && !Array.isArray(x))
+    .map((x) => {
+      const out = finiteNumbers({ ...x });
+      out.pCol = x.pCol === 'b' ? 'b' : 'w';
+      out.result = (x.result === 'w' || x.result === 'b' || x.result === 'draw') ? x.result : 'draw';
+      out.diff = typeof x.diff === 'string' ? x.diff : 'casual';
+      return out;
+    });
 }
 function saveProfile(p) {
   try { localStorage.setItem(PROFILE_KEY, JSON.stringify(p.slice(-MAX_PROFILE_GAMES))); } catch {}
@@ -2201,25 +2856,112 @@ function avgCpLoss(verbose, evals) {
   return { w: counts.w ? Math.round(sums.w / counts.w) : null, b: counts.b ? Math.round(sums.b / counts.b) : null };
 }
 
-function recordProfileEntry() {
+/* phase classification: opening (<20 ply), endgame (<=8 non-pawn/non-king pieces), else middlegame */
+function phaseOfPly(ply, nonPawnCount) {
+  if (ply < 20) return 'open';
+  if (nonPawnCount <= 8) return 'end';
+  return 'mid';
+}
+
+function phasesForHistory(verbose) {
+  const tmp = new Chess();
+  const phases = [];
+  for (let i = 0; i < verbose.length; i++) {
+    const mv = verbose[i];
+    try {
+      const req = { from: mv.from, to: mv.to };
+      if (mv.promotion) req.promotion = mv.promotion;
+      tmp.move(req);
+    } catch {
+      phases.push(phaseOfPly(i, 16));
+      continue;
+    }
+    let nonPawn = 0;
+    for (const row of tmp.board()) {
+      for (const sq of row) {
+        if (sq && sq.type !== 'p' && sq.type !== 'k') nonPawn++;
+      }
+    }
+    phases.push(phaseOfPly(i, nonPawn));
+  }
+  return phases;
+}
+
+function computePhaseStats(verbose, evals, moveTimes, userColor) {
+  const phases = phasesForHistory(verbose);
+  const timeByPly = new Map();
+  for (const t of moveTimes || []) timeByPly.set(t.ply, t);
+  const empty = () => ({ moves: 0, accSum: 0, lossSum: 0, evalCount: 0, blunders: 0, thinkSum: 0, thinkCount: 0, rush: 0, acc: null, cpLoss: null, blundersPerMove: null });
+  const out = { open: empty(), mid: empty(), end: empty() };
+  const evalList = evals || [];
+  for (let j = 0; j < verbose.length; j++) {
+    if (verbose[j].color !== userColor) continue;
+    const st = out[phases[j]];
+    if (!st) continue;
+    st.moves++;
+    const before = evalList[j], after = evalList[j + 1];
+    if (before != null && after != null) {
+      const sign = userColor === 'w' ? 1 : -1;
+      const loss = Math.max(0, sign * (before - after));
+      if (loss <= 10000) { // skip mate swings, matching avgCpLoss()
+        st.accSum += 100 * Math.exp(-0.0008 * loss);
+        st.lossSum += loss;
+        st.evalCount++;
+      }
+    }
+    if (state.moveTags[j] === '??') st.blunders++;
+    const t = timeByPly.get(j);
+    if (t && typeof t.ms === 'number' && t.ms <= 60000) { // ignore idle / away-from-board time
+      st.thinkSum += t.ms;
+      st.thinkCount++;
+      if (t.ms < 2000) st.rush++;
+    }
+  }
+  for (const key of ['open', 'mid', 'end']) {
+    const st = out[key];
+    st.acc = st.evalCount ? st.accSum / st.evalCount : null;
+    st.cpLoss = st.evalCount ? Math.round(st.lossSum / st.evalCount) : null;
+    st.blundersPerMove = st.moves ? st.blunders / st.moves : null;
+  }
+  return out;
+}
+
+function recordProfileEntry(ts = null) {
   // only track games played against the engine; two-player on one machine knows nothing useful about "the user"
   if (state.mode !== 'engine') return;
   const verbose = game.history({ verbose: true });
   if (!verbose.length) return;
-  const acc = state.lastAcc || computeAccuracies();
+  // recompute from the final position — async analysis may have finished after the last UI refresh
+  computeTags();
+  state.lastAcc = computeAccuracies();
+  const acc = state.lastAcc;
   const losses = avgCpLoss(verbose, state.evalHistory);
   const blunders = blunderCounts(verbose);
-  const thinkW = state.moveTimes.filter((t) => t.color === 'w');
-  const thinkB = state.moveTimes.filter((t) => t.color === 'b');
+  let evalPairs = 0; // usable before/after eval pairs for the user's own moves
+  const sign = state.playerColor === 'w' ? 1 : -1;
+  for (let i = 1; i <= verbose.length; i++) {
+    if (verbose[i - 1].color !== state.playerColor) continue;
+    const before = state.evalHistory[i - 1], after = state.evalHistory[i];
+    if (before == null || after == null) continue;
+    if (sign * (before - after) > 10000) continue; // mate swing
+    evalPairs++;
+  }
+  const analysed = state.evalHistory.reduce((n, v) => n + (v != null ? 1 : 0), 0);
+  const thinkW = state.moveTimes.filter((t) => t.color === 'w' && t.ms <= 60000);
+  const thinkB = state.moveTimes.filter((t) => t.color === 'b' && t.ms <= 60000);
   const thinkMsW = thinkW.length ? Math.round(thinkW.reduce((s, t) => s + t.ms, 0) / thinkW.length) : 0;
   const thinkMsB = thinkB.length ? Math.round(thinkB.reduce((s, t) => s + t.ms, 0) / thinkB.length) : 0;
-  const result = state.winnerColor ? state.winnerColor : 'draw';
+  const phases = computePhaseStats(verbose, state.evalHistory, state.moveTimes, state.playerColor);
+  const opening = openingName(game.history()) || 'Unorthodox / Offbeat Play';
+  const result = game.isCheckmate() ? (game.turn() === 'w' ? 'b' : 'w') : 'draw';
   const entry = {
-    ts: Date.now(),
+    ts: ts ?? Date.now(),
     mode: 'engine',
-    diff: state.difficulty,
+    diff: state.gameDifficulty || state.difficulty,
     pCol: state.playerColor,
     result,
+    evalPairs,
+    analysed,
     moves: verbose.length,
     accW: acc.wAcc != null ? Math.round(acc.wAcc) : null,
     accB: acc.bAcc != null ? Math.round(acc.bAcc) : null,
@@ -2229,8 +2971,15 @@ function recordProfileEntry() {
     blundersB: blunders.b,
     thinkMsW,
     thinkMsB,
+    open: opening,
+    phases,
+    thinkPhases: {
+      open: { sum: phases.open.thinkSum, count: phases.open.thinkCount, rush: phases.open.rush },
+      mid:  { sum: phases.mid.thinkSum, count: phases.mid.thinkCount, rush: phases.mid.rush },
+      end:  { sum: phases.end.thinkSum, count: phases.end.thinkCount, rush: phases.end.rush },
+    },
   };
-  const profile = loadProfile();
+  const profile = loadProfile().filter((x) => x.ts !== entry.ts); // replacing a refined entry, not duplicating it
   profile.push(entry);
   saveProfile(profile);
   refreshProfile();
@@ -2240,14 +2989,119 @@ function setPstat(id, val, cls) {
   const el = document.getElementById(id);
   if (el) { el.textContent = val; el.className = cls || ''; }
 }
+
+function setTrackingStat(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+function clearTrackingList(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  while (el.firstChild) el.removeChild(el.firstChild);
+}
+function addTrackingRow(id, text) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const row = document.createElement('div');
+  row.textContent = text;
+  el.appendChild(row);
+}
+
+function refreshTrackingAnalytics(games) {
+  const withNew = games.filter((x) => x && x.phases && x.thinkPhases);
+  const phaseKeys = ['open', 'mid', 'end'];
+  const phaseStatIds = { open: 'ph-open', mid: 'ph-mid', end: 'ph-end' };
+  const phaseTimeIds = { open: 'time-open', mid: 'time-mid', end: 'time-end' };
+
+  // per-phase accuracy / centipawn loss / blunders for the user's colour
+  for (const key of phaseKeys) {
+    let accSum = 0, evalCount = 0, lossSum = 0, blunders = 0, moves = 0;
+    for (const x of withNew) {
+      const st = x.phases[key];
+      if (!st) continue;
+      accSum += Number(st.accSum) || 0;
+      lossSum += Number(st.lossSum) || 0;
+      evalCount += Number(st.evalCount) || 0;
+      blunders += Number(st.blunders) || 0;
+      moves += Number(st.moves) || 0;
+    }
+    if (!evalCount && !moves) { setTrackingStat(phaseStatIds[key], '–'); continue; }
+    // too few evaluated moves for a meaningful percentage — be explicit about the gap
+    if (evalCount < Math.max(6, Math.ceil(moves * 0.6))) {
+      setTrackingStat(phaseStatIds[key], `Need more analysis (${evalCount}/${moves})`);
+      continue;
+    }
+    const acc = Math.round(accSum / evalCount);
+    const cp = Math.round(lossSum / evalCount);
+    const bl = moves ? (blunders / moves).toFixed(2) : (0).toFixed(2);
+    setTrackingStat(phaseStatIds[key], `Est ${acc}% (${evalCount}/${moves}) · loss ${cp}cp · ${bl}/mv`);
+  }
+
+  // average think time per phase + rush rate (user moves under 2s)
+  let rush = 0, timed = 0;
+  for (const key of phaseKeys) {
+    let sum = 0, count = 0;
+    for (const x of withNew) {
+      const tp = x.thinkPhases[key];
+      if (!tp) continue;
+      sum += tp.sum || 0;
+      count += tp.count || 0;
+      rush += tp.rush || 0;
+      timed += tp.count || 0;
+    }
+    setTrackingStat(phaseTimeIds[key], count ? (sum / count / 1000).toFixed(1) + 's' : '–');
+  }
+  setTrackingStat('time-rush', timed ? `${rush}/${timed} (${Math.round(rush / timed * 100)}%)` : '–');
+
+  // opening repertoire: top 5 by games played
+  clearTrackingList('opening-list');
+  const openings = new Map();
+  for (const x of games) {
+    if (!x || typeof x.open !== 'string' || !x.open) continue;
+    let rec = openings.get(x.open);
+    if (!rec) { rec = { games: 0, w: 0, d: 0, l: 0, accSum: 0, accN: 0 }; openings.set(x.open, rec); }
+    rec.games++;
+    if (x.result === 'draw') rec.d++;
+    else if (x.result === x.pCol) rec.w++;
+    else rec.l++;
+    const acc = x.pCol === 'w' ? x.accW : x.accB;
+    if (acc != null) { rec.accSum += acc; rec.accN++; }
+  }
+  const topOpenings = [...openings.entries()].sort((a, b) => b[1].games - a[1].games).slice(0, 5);
+  for (const [name, rec] of topOpenings) {
+    const accTxt = rec.accN ? Math.round(rec.accSum / rec.accN) + '%' : '–';
+    addTrackingRow('opening-list', `${name} — ${rec.games} ${rec.games === 1 ? 'game' : 'games'} · ${rec.w}-${rec.d}-${rec.l} · est acc ${accTxt}`);
+  }
+
+  // difficulty ladder: one row per level with games
+  clearTrackingList('ladder-list');
+  const ladder = new Map();
+  for (const x of games) {
+    if (!x) continue;
+    let rec = ladder.get(x.diff);
+    if (!rec) { rec = { games: 0, wins: 0, accSum: 0, accN: 0 }; ladder.set(x.diff, rec); }
+    rec.games++;
+    if (x.result === x.pCol) rec.wins++;
+    const acc = x.pCol === 'w' ? x.accW : x.accB;
+    if (acc != null) { rec.accSum += acc; rec.accN++; }
+  }
+  for (const d of DIFFS) {
+    const rec = ladder.get(d.id);
+    if (!rec || !rec.games) continue;
+    const accTxt = rec.accN ? Math.round(rec.accSum / rec.accN) + '%' : '–';
+    addTrackingRow('ladder-list', `${d.label} — ${rec.games} ${rec.games === 1 ? 'game' : 'games'} · ${Math.round(rec.wins / rec.games * 100)}% win · est acc ${accTxt}`);
+  }
+}
+
 function refreshProfile() {
   const profile = loadProfile();
   const g = profile.filter((p) => p.mode === 'engine');
+  refreshTrackingAnalytics(g);
   if (!g.length) {
     setPstat('p-games', '0'); setPstat('p-wdl', '0-0-0'); setPstat('p-wrate', '–');
     setPstat('p-acc', '–'); setPstat('p-loss', '–'); setPstat('p-blunder', '–');
     const strk = document.getElementById('profile-streak');
-    if (strk) strk.innerHTML = 'Streak vs Stockfish · <b>—</b> <span style="opacity:.55">· avg —</span>';
+    if (strk) strk.innerHTML = 'Streak vs FENTSTEIN-TEHN · <b>—</b> <span style="opacity:.55">· avg —</span>';
     setPstat('glabel-trend', '–');
     drawAccuracyTrend([]);
     return;
@@ -2268,7 +3122,7 @@ function refreshProfile() {
   setPstat('p-wdl', `${wins}-${draws}-${losses}`);
   setPstat('p-wrate', winRate + '%', winRate >= 55 ? 'good' : winRate <= 40 ? 'hot' : '');
   setPstat('p-acc', avgAcc != null ? avgAcc + '%' : '–', avgAcc != null && avgAcc >= 75 ? 'good' : avgAcc != null && avgAcc < 55 ? 'hot' : '');
-  setPstat('p-loss', avgLoss != null ? '+' + avgLoss : '–');
+  setPstat('p-loss', avgLoss != null ? avgLoss + 'cp' : '–');
   setPstat('p-blunder', avgBl != null ? avgBl.toFixed(1) : '–', avgBl != null && avgBl > 1.5 ? 'hot' : '');
 
   // streak vs Stockfish
@@ -2284,7 +3138,7 @@ function refreshProfile() {
   const streakTxt = o === 'draw' ? '—' : `${o}${streak}`;
   const thrTxt = avgThink != null ? `${(avgThink / 1000).toFixed(1)}s/move` : '—';
   const strk = document.getElementById('profile-streak');
-  if (strk) strk.innerHTML = `Streak vs Stockfish · <b>${streakTxt}</b> <span style="opacity:.55">· avg ${thrTxt}</span>`;
+  if (strk) strk.innerHTML = `Streak vs FENTSTEIN-TEHN · <b>${streakTxt}</b> <span style="opacity:.55">· avg ${thrTxt}</span>`;
 
   const last20 = g.slice(-20);
   const trend = last20.map((x) => (x.pCol === 'w' ? x.accW : x.accB));
@@ -2340,8 +3194,13 @@ function drawAccuracyTrend(values) {
 }
 
 document.getElementById('btn-reset-profile')?.addEventListener('click', () => {
-  if (!confirm('Erase locally-tracked games and stats?')) return;
-  try { localStorage.removeItem(PROFILE_KEY); } catch {}
+  if (!confirm('Erase locally-tracked games, stats and record?')) return;
+  try {
+    localStorage.removeItem(PROFILE_KEY);
+    localStorage.removeItem(RECORD_KEY);
+  } catch {}
+  record = { w: 0, d: 0, l: 0 };
+  renderRecord();
   refreshProfile();
   showToast('Local tracking data cleared');
 });

@@ -12,6 +12,7 @@
   "dependencies": {
     "chess.js": "^1.4.0",
     "stockfish": "^19.0.1",
-    "three": "^0.187.0"
+    "three": "^0.187.0",
+    "ws": "^8.23.0"
   }
 }

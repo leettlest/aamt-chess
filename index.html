@@ -29,7 +29,7 @@
       <div id="brand-mark">♞</div>
       <div>
         <h1>Royal 3D Chess</h1>
-        <p>Powered by <span>Stockfish 19</span></p>
+        <p>Powered by <span>FENTSTEIN-TEHN</span></p>
       </div>
     </div>
 
@@ -44,7 +44,7 @@
 
     <!-- Think spinner -->
     <div id="thinking" class="hidden">
-      <div class="ring"></div><span>Stockfish is thinking…</span>
+      <div class="ring"></div><span>FENTSTEIN-TEHN is thinking…</span>
     </div>
 
     <!-- Promotion picker -->
@@ -65,14 +65,14 @@
       <div id="coach-card">
         <div id="coach-head">
           <div id="coach-title">
-            <div id="coach-mark">♞</div>
+            <div id="coach-mark">C</div>
             <div>
               <h3>AI Coach</h3>
               <p id="coach-status">Not connected — add a key</p>
             </div>
           </div>
           <div id="coach-head-actions">
-            <button id="coach-settings-toggle" class="mini-btn" title="Coach settings">🔑&nbsp; Key</button>
+            <button id="coach-settings-toggle" class="mini-btn" title="Coach settings">Key</button>
             <button id="coach-close" class="icon-btn" aria-label="Close coach">✕</button>
           </div>
         </div>
@@ -114,15 +114,15 @@
         <div id="coach-thread" aria-live="polite"></div>
 
         <div id="coach-chips">
-          <button class="chip" data-q="Explain this position in plain words — what's the story and who's better?">📖 Explain the position</button>
-          <button class="chip" data-q="What is my best move here and why? Give me the SAN and a one-line reason.">🧠 Best move</button>
-          <button class="chip" data-q="Look at my last move with fresh eyes — was it good? What did it miss?">🔍 Review my last move</button>
-          <button class="chip" data-q="Teach me one concrete thing to work on right now — something I can fix this game.">🎯 Homework</button>
+          <button class="chip" data-q="Explain this position in plain words — what's the story and who's better?">Explain the position</button>
+          <button class="chip" data-q="What is my best move here and why? Give me the SAN and a one-line reason.">Best move</button>
+          <button class="chip" data-q="Look at my last move with fresh eyes — was it good? What did it miss?">Review my last move</button>
+          <button class="chip" data-q="Teach me one concrete thing to work on right now — something I can fix this game.">Homework</button>
         </div>
 
         <form id="coach-form" autocomplete="off">
           <textarea id="coach-input" rows="1" placeholder="Ask the coach… (Enter to send, Shift+Enter for new line)" aria-label="Ask the coach"></textarea>
-          <button type="submit" id="coach-send" aria-label="Send">➤</button>
+          <button type="submit" id="coach-send" aria-label="Send">Send</button>
         </form>
       </div>
     </div>
@@ -130,7 +130,7 @@
     <!-- Game over card -->
     <div id="gameover" class="hidden">
       <div id="gameover-card">
-        <div id="gameover-glyph">👑</div>
+        <div id="gameover-glyph"></div>
         <h2 id="gameover-title">Checkmate</h2>
         <p id="gameover-sub">White wins</p>
         <button id="gameover-again">Play Again</button>
@@ -143,7 +143,7 @@
     <!-- Matchup header: this vs this -->
     <div class="card matchup" id="matchup">
       <div class="mrow" id="mrow-w">
-        <div class="m-avatar m-avatar-w">♔</div>
+        <div class="m-avatar m-avatar-w"><img id="avatar-w" src="assets/userr.jpg" alt="User"></div>
         <div class="m-info">
           <div class="m-name" id="m-name-w">White</div>
           <div class="m-sub" id="m-sub-w">White</div>
@@ -153,9 +153,9 @@
           <div class="m-caps"><span class="m-pieces" id="m-caps-w"></span><span class="m-score" id="m-score-w"></span></div>
         </div>
       </div>
-      <div class="m-divider"><span>VS</span></div>
+      <div class="m-divider"><img src="assets/vs.jpg" alt="versus"></div>
       <div class="mrow" id="mrow-b">
-        <div class="m-avatar m-avatar-b">♚</div>
+        <div class="m-avatar m-avatar-b"><img id="avatar-b" src="assets/fentstein.jpg" alt="Engine"></div>
         <div class="m-info">
           <div class="m-name" id="m-name-b">Black</div>
           <div class="m-sub" id="m-sub-b">Black</div>
@@ -173,17 +173,18 @@
     </div>
 
     <div class="card">
-      <div class="card-title">Game Mode</div>
+      <div class="card-title">Play mode</div>
       <div class="segmented" id="mode-seg">
-        <button class="seg active" data-mode="engine">♟ vs Engine</button>
-        <button class="seg" data-mode="local">♟♟ Two Players</button>
+        <button class="seg active" data-mode="engine">Engine</button>
+        <button class="seg" data-mode="local">Two Players</button>
+        <button class="seg" data-mode="lan">LAN</button>
       </div>
 
       <div id="engine-opts">
-        <div class="card-title" style="margin-top:14px">Difficulty</div>
+        <div class="card-title" style="margin-top:14px">Engine level</div>
         <div class="diff-grid" id="diff-grid"></div>
 
-        <div class="card-title" style="margin-top:14px">Play as</div>
+        <div class="card-title" style="margin-top:14px">Your side</div>
         <div class="segmented" id="color-seg">
           <button class="seg active" data-color="w">White</button>
           <button class="seg" data-color="random">Random</button>
@@ -192,21 +193,38 @@
       </div>
     </div>
 
+    <div class="card lan-card hidden" id="lan-card">
+      <div class="card-title">LAN game</div>
+      <div id="lan-status">Not connected</div>
+      <div class="lan-code-row">
+        <span class="lan-label">Room code</span>
+        <b id="lan-code">—</b>
+        <button id="lan-copy" class="mini-btn">Copy</button>
+      </div>
+      <input id="lan-join-code" maxlength="5" placeholder="Enter 5-letter code" autocomplete="off" spellcheck="false">
+      <div class="lan-actions">
+        <button id="lan-create" class="btn">Create game</button>
+        <button id="lan-join" class="btn primary">Join game</button>
+      </div>
+      <div class="lan-hint">Both players open this site from the same network. Share the code. Server address: <span id="lan-host"></span></div>
+    </div>
+
     <div class="card actions">
-      <button id="btn-new" class="btn primary">⟳&nbsp; New Game</button>
-      <button id="btn-flip" class="btn">⤾&nbsp; Flip</button>
-      <button id="btn-undo" class="btn">↩&nbsp; Undo</button>
-      <button id="btn-hint" class="btn">💡&nbsp; Hint</button>
-      <button id="btn-coach" class="btn">♞&nbsp; Coach</button>
-      <button id="btn-sound" class="btn icon" title="Toggle sound">🔊</button>
+      <button id="btn-new" class="btn primary">New Game</button>
+      <button id="btn-flip" class="btn">Flip</button>
+      <button id="btn-view" class="btn" title="Toggle board view">2D</button>
+      <button id="btn-undo" class="btn">Undo</button>
+      <button id="btn-hint" class="btn">Hint</button>
+      <button id="btn-coach" class="btn">Coach</button>
+      <button id="btn-sound" class="btn" title="Toggle sound">Sound On</button>
     </div>
 
 
 
     <div class="card" id="analytics-card">
       <div class="card-title-row">
-        <div class="card-title" style="margin:0">Analytics &amp; Predictions</div>
-        <button id="btn-analyze" class="mini-btn">Deep Analyze</button>
+        <div class="card-title" style="margin:0">Analysis</div>
+        <button id="btn-analyze" class="mini-btn">Analyze</button>
       </div>
       <div id="opening-line"><span>Opening</span> · awaiting first moves…</div>
 
@@ -249,21 +267,48 @@
 
     <div class="card" id="profile-card">
       <div class="card-title-row">
-        <div class="card-title" style="margin:0">Tracking SDK</div>
-        <button id="btn-reset-profile" class="mini-btn danger">Reset data</button>
+        <div>
+          <div class="card-title" style="margin:0">Your progress</div>
+          <p class="profile-sub">Only games vs Stockfish are tracked. Figures are engine estimates from analysed moves.</p>
+        </div>
+        <button id="btn-reset-profile" class="mini-btn danger">Clear</button>
       </div>
       <div class="profile-grid">
         <div class="pstat"><small>Games</small><b id="p-games">0</b></div>
         <div class="pstat"><small>W–D–L</small><b id="p-wdl">0-0-0</b></div>
         <div class="pstat"><small>Win rate</small><b id="p-wrate">–</b></div>
-        <div class="pstat"><small>Avg acc</small><b id="p-acc">–</b></div>
-        <div class="pstat"><small>Avg cp loss</small><b id="p-loss">–</b></div>
+        <div class="pstat"><small>Est. acc</small><b id="p-acc">–</b></div>
+        <div class="pstat"><small>Avg loss</small><b id="p-loss">–</b></div>
         <div class="pstat"><small>Blunders / game</small><b id="p-blunder">–</b></div>
       </div>
       <div id="profile-streak">Streak vs Stockfish · <b>—</b></div>
       <div class="graph-label"><span>Accuracy — last 20</span><b id="glabel-trend">–</b></div>
       <canvas id="acc-trend-graph" class="graph-sm"></canvas>
-      <div id="profile-foot">local to this browser · resets only when you clear it</div>
+      <div id="track-analytics" class="track-blocks">
+        <div class="track-block">
+          <div class="track-head"><span>Phase breakdown</span><em>Acc · cp loss · blunders</em></div>
+          <div class="track-row"><span class="track-key">Opening</span><b class="track-val" id="ph-open">–</b></div>
+          <div class="track-row"><span class="track-key">Middlegame</span><b class="track-val" id="ph-mid">–</b></div>
+          <div class="track-row"><span class="track-key">Endgame</span><b class="track-val" id="ph-end">–</b></div>
+        </div>
+        <div class="track-block">
+          <div class="track-head"><span>Opening repertoire</span><em>Top 5 by games</em></div>
+          <div class="track-list" id="opening-list"></div>
+        </div>
+        <div class="track-block">
+          <div class="track-head"><span>Time management</span><em>Average think time</em></div>
+          <div class="track-row"><span class="track-key">Opening</span><b class="track-val" id="time-open">–</b></div>
+          <div class="track-row"><span class="track-key">Middlegame</span><b class="track-val" id="time-mid">–</b></div>
+          <div class="track-row"><span class="track-key">Endgame</span><b class="track-val" id="time-end">–</b></div>
+          <div class="track-row track-row-hi"><span class="track-key">Rushed &lt;2s</span><b class="track-val" id="time-rush">–</b></div>
+        </div>
+        <div class="track-block">
+          <div class="track-head"><span>Difficulty ladder</span><em>vs Stockfish</em></div>
+          <div class="track-list" id="ladder-list"></div>
+        </div>
+        <p class="track-legend">Est. accuracy/loss come from Stockfish. Blunders = moves losing 300cp+, per user move.</p>
+      </div>
+      <div id="profile-foot">Last 50 games · stored in this browser · cleared with Reset data</div>
     </div>
 
     <div class="card moves-card">
